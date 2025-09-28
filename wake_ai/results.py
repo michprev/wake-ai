@@ -1,6 +1,6 @@
 """Modular result system for AI workflows."""
 
-from abc import ABC, abstractmethod
+import dataclasses
 from pathlib import Path
 from typing import Any, Dict, TYPE_CHECKING
 import json
@@ -9,36 +9,34 @@ if TYPE_CHECKING:
     from rich.console import Console
 
 
-class AIResult(ABC):
+class AIResult:
     """Base class for AI workflow results.
 
     Any result type that implements these methods can be used by the AI CLI.
     This allows each workflow to define its own result structure and formatting.
     """
 
-    @classmethod
-    @abstractmethod
-    def from_working_dir(cls, working_dir: Path, raw_results: Dict[str, Any]) -> "AIResult":
-        """Create a result instance by parsing the working directory.
-
-        Args:
-            working_dir: Path to the workflow's working directory
-            raw_results: Raw results dict from workflow execution
-
-        Returns:
-            An instance of the result class with parsed data
-        """
-        ...
-
-    @abstractmethod
     def pretty_print(self, console: "Console") -> None:
-        """Print the result in a human-readable format to the console."""
-        ...
+        """Print as a formatted table."""
+        from rich.table import Table
 
-    @abstractmethod
+        table = Table(title="Result", show_header=True)
+        table.add_column("Key", style="cyan")
+        table.add_column("Value")
+
+        for key, value in self.to_dict().items():
+            table.add_row(key, str(value))
+
+        console.print(table)
+
     def to_dict(self) -> Dict[str, Any]:
-        """Convert the result to a dictionary for JSON serialization."""
-        ...
+        if dataclasses.is_dataclass(self):
+            return dataclasses.asdict(self)
+        else:
+            return {
+                k: v for k, v in self.__dict__.items()
+                if not k.startswith("_") and not callable(v)
+            }
 
     def export_json(self, path: Path) -> None:
         """Export the result to a JSON file.

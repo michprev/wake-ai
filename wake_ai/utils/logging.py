@@ -1,7 +1,7 @@
 import logging
 from typing import Optional
 
-_debug: bool = False
+_verbosity_level: int = 0
 _created_logger_names: set[str] = set()
 
 
@@ -12,16 +12,30 @@ def get_logger(name: str, override_level: Optional[int] = None) -> logging.Logge
         logger.setLevel(override_level)
     else:
         _created_logger_names.add(name)
-        logger.setLevel(logging.DEBUG if _debug else logging.INFO)
+        if _verbosity_level == 0:
+            level = logging.WARNING
+        elif _verbosity_level == 1:
+            level = logging.INFO
+        else:
+            level = logging.DEBUG
+        logger.setLevel(level)
     return logger
 
 
-def set_debug(debug: bool) -> None:
-    global _debug
-    _debug = debug
+
+def set_verbosity_level(level: int) -> None:
+    global _verbosity_level
+    _verbosity_level = level
+    if level == 0:
+        level = logging.WARNING
+    elif level == 1:
+        level = logging.INFO
+    else:
+        level = logging.DEBUG
+
     for name in _created_logger_names:
-        get_logger(name).setLevel(logging.DEBUG if _debug else logging.INFO)
+        get_logger(name).setLevel(level)
 
 
-def get_debug() -> bool:
-    return _debug
+def get_verbosity_level() -> int:
+    return _verbosity_level

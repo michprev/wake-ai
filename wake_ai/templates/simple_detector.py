@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Dict, Any, List, Tuple
 import yaml
 
-from ..core.flow import AIWorkflow, ClaudeCodeResponse
+from ..core import AIWorkflow, WorkflowStep
 from ..detections import Detection, Location, Severity
 from ..results import AIResult
 from ..utils.logging import get_logger
@@ -20,66 +20,6 @@ class SimpleDetectorResult(AIResult):
         """Initialize with detections and working directory."""
         self.detections = detections
         self.working_dir = working_dir
-
-    @classmethod
-    def from_working_dir(cls, working_dir: Path, raw_results: Dict[str, Any]) -> "SimpleDetectorResult":
-        """Parse detector results from the simplified results.yaml format."""
-        # Create instance first with empty detections
-        instance = cls([], working_dir)
-
-        # Parse results.yaml directly
-        results_file = working_dir / "results.yaml"
-        detections = []
-
-        if results_file.exists():
-            try:
-                with open(results_file, 'r') as f:
-                    data = yaml.safe_load(f)
-
-                detector_name = raw_results.get('workflow', 'simple-detector')
-
-                for detection_data in data.get('detections', []):
-                    # Parse location if present
-                    location = None
-                    if 'location' in detection_data:
-                        loc = detection_data['location']
-                        location = Location(
-                            target=loc.get('target', 'Unknown'),
-                            file_path=Path(loc['file']) if 'file' in loc else None,
-                            start_line=loc.get('start_line'),
-                            end_line=loc.get('end_line'),
-                            source_snippet=loc.get('snippet')
-                        )
-
-                    # Map severity
-                    severity_str = detection_data.get('severity', 'medium').lower()
-                    severity_map = {
-                        'info': Severity.INFO,
-                        'warning': Severity.WARNING,
-                        'low': Severity.LOW,
-                        'medium': Severity.MEDIUM,
-                        'high': Severity.HIGH,
-                        'critical': Severity.CRITICAL
-                    }
-                    severity = severity_map.get(severity_str, Severity.MEDIUM)
-
-                    detection = Detection(
-                        name=detection_data.get('title', 'Unnamed Detection'),
-                        severity=severity,
-                        detection_type=detection_data.get('type', 'vulnerability'),
-                        location=location,
-                        description=detection_data.get('description', ''),
-                        recommendation=detection_data.get('recommendation'),
-                        exploit=detection_data.get('exploit')
-                    )
-                    detections.append((detector_name, detection))
-
-            except Exception as e:
-                logger.error(f"Failed to parse results.yaml: {e}")
-
-        # Set the parsed detections
-        instance.detections = detections
-        return instance
 
     def pretty_print(self, console):
         """Pretty print the detections to console."""
@@ -126,8 +66,25 @@ class SimpleDetector(AIWorkflow):
     2. Handling the workflow setup and validation automatically
     3. Parsing results into standardized AIDetection format
     """
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs, result_class=SimpleDetectorResult)
+    def __init__(self, model: str, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        # Get the detector-specific prompt
+        detector_prompt = self.get_detector_prompt()
+
+        # Wrap it with instructions for structured output
+        full_prompt = self._build_analysis_prompt(detector_prompt)
+
+        # Add single analysis step
+        self.add_step(
+            name="analyze",
+            model=model,
+            prompt=full_prompt,
+            max_cost=20.0,
+            validator=self._validate_results,
+            max_validation_retries=3,
+            max_validation_retry_cost=10.0
+        )
 
     @abstractmethod
     def get_detector_prompt(self) -> str:
@@ -140,27 +97,7 @@ class SimpleDetector(AIWorkflow):
 
         The prompt will be wrapped with instructions to output to results.yaml.
         """
-        pass
-
-    def _setup_steps(self):
-        """Setup the detector workflow with a single analysis step."""
-        # Get the detector-specific prompt
-        detector_prompt = self.get_detector_prompt()
-
-        # Wrap it with instructions for structured output
-        full_prompt = self._build_analysis_prompt(detector_prompt)
-
-        # Add single analysis step
-        # Using None for allowed_tools to inherit the secure defaults from AIWorkflow
-        self.add_step(
-            name="analyze",
-            prompt_template=full_prompt,
-            allowed_tools=None,  # Use parent class defaults which include all necessary tools
-            max_cost=20.0,
-            validator=self._validate_results,
-            max_retries=3,
-            max_retry_cost=10.0
-        )
+        ...
 
     def _build_analysis_prompt(self, detector_prompt: str) -> str:
         """Build the full analysis prompt with output instructions."""
@@ -286,30 +223,26 @@ detections: []
 ```
 </output_format>"""
 
-    def _validate_results(self, response: ClaudeCodeResponse) -> Tuple[bool, List[str]]:
+    def _validate_results(self, step: WorkflowStep) -> list[str]:
         """Validate that results.yaml was created with proper structure."""
         errors = []
 
         results_file = self.working_dir / "results.yaml"
         if not results_file.exists():
-            errors.append(f"Results file not created at {results_file}")
-            return (False, errors)
+            return [f"Results file not created at {results_file}"]
 
         try:
             with open(results_file, 'r') as f:
                 data = yaml.safe_load(f)
 
             if not isinstance(data, dict):
-                errors.append("Results file should contain a dictionary")
-                return (False, errors)
+                return ["Results file should contain a dictionary"]
 
             if 'detections' not in data:
-                errors.append("Results file missing 'detections' key")
-                return (False, errors)
+                return ["Results file missing 'detections' key"]
 
             if not isinstance(data['detections'], list):
-                errors.append("'detections' should be a list")
-                return (False, errors)
+                return ["'detections' should be a list"]
 
             # Validate each detection
             for i, detection in enumerate(data['detections']):
@@ -348,4 +281,58 @@ detections: []
         except Exception as e:
             errors.append(f"Error validating results file: {e}")
 
-        return (len(errors) == 0, errors)
+        return errors
+
+    def collect_result(self) -> SimpleDetectorResult:
+        """Parse detector results from the simplified results.yaml format."""
+        # Parse results.yaml directly
+        results_file = self.working_dir / "results.yaml"
+        detections = []
+
+        if results_file.exists():
+            try:
+                with open(results_file, 'r') as f:
+                    data = yaml.safe_load(f)
+
+                detector_name = raw_results.get('workflow', 'simple-detector')
+
+                for detection_data in data.get('detections', []):
+                    # Parse location if present
+                    location = None
+                    if 'location' in detection_data:
+                        loc = detection_data['location']
+                        location = Location(
+                            target=loc.get('target', 'Unknown'),
+                            file_path=Path(loc['file']) if 'file' in loc else None,
+                            start_line=loc.get('start_line'),
+                            end_line=loc.get('end_line'),
+                            source_snippet=loc.get('snippet')
+                        )
+
+                    # Map severity
+                    severity_str = detection_data.get('severity', 'medium').lower()
+                    severity_map = {
+                        'info': Severity.INFO,
+                        'warning': Severity.WARNING,
+                        'low': Severity.LOW,
+                        'medium': Severity.MEDIUM,
+                        'high': Severity.HIGH,
+                        'critical': Severity.CRITICAL
+                    }
+                    severity = severity_map.get(severity_str, Severity.MEDIUM)
+
+                    detection = Detection(
+                        name=detection_data.get('title', 'Unnamed Detection'),
+                        severity=severity,
+                        detection_type=detection_data.get('type', 'vulnerability'),
+                        location=location,
+                        description=detection_data.get('description', ''),
+                        recommendation=detection_data.get('recommendation'),
+                        exploit=detection_data.get('exploit')
+                    )
+                    detections.append((detector_name, detection))
+
+            except Exception as e:
+                logger.error(f"Failed to parse results.yaml: {e}")
+
+        return SimpleDetectorResult(detections, self.working_dir)

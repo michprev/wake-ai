@@ -4,12 +4,10 @@ from .cli import main as workflow
 
 # Framework imports
 from .core import (
-    ClaudeCodeResponse,
-    ClaudeCodeSession,
     AIWorkflow,
     WorkflowStep,
-    ClaudeNotAvailableError,
-    WorkflowExecutionError,
+    ClaudeSession,
+    CodexSession,
 )
 
 # Result imports
@@ -40,33 +38,3 @@ from .templates import (
     SimpleDetector,
     SimpleDetectorResult,
 )
-
-
-__version__ = "0.1.0"
-
-__all__ = [
-    # Framework
-    "ClaudeCodeResponse",
-    "ClaudeCodeSession",
-    "AIWorkflow",
-    "WorkflowStep",
-    "ClaudeNotAvailableError",
-    "WorkflowExecutionError",
-    # Results
-    "AIResult",
-    "SimpleResult",
-    "MessageResult",
-    # Detections
-    "Detection",
-    "Location",
-    "Severity",
-    "print_detection",
-    "export_detections_json",
-    # Utils
-    "load_workflow_from_file",
-    # Templates
-    "SimpleDetector",
-    "SimpleDetectorResult",
-    # Version
-    "__version__",
-]

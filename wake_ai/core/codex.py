@@ -1,0 +1,271 @@
+import asyncio
+import json
+from datetime import datetime
+from pathlib import Path
+from typing import AsyncIterator, TypedDict, Any, NamedTuple, Literal
+
+from rich.console import Console
+from rich.rule import Rule
+
+from .codex_pricing import CodexTokenPricing, GPT_PRICING
+from .verbose_formatter import VerboseFormatter
+from ..utils.logging import get_logger
+
+logger = get_logger(__name__)
+
+
+TERMINATION_PROMPT = (
+    "You are approaching the cost limit. Please finish the task as quickly as possible."
+)
+
+COLORS = {
+    "todo_header": "bold blue",
+    "todo_complete": "bold green",
+    "todo_progress": "yellow",
+    "todo_pending": "dim white",
+    "tool_use": "bright_magenta",
+    "tool_input": "magenta",
+    "tool_result": "bright_cyan",
+    "tool_result_json": "cyan",
+    "tool_error": "bold red",
+    "system_msg": "purple",
+    "thinking": "white",
+    "unknown": "dim red",
+    "truncation": "dim italic yellow",
+}
+
+
+class TotalTokenUsage(TypedDict):
+    input_tokens: int
+    cached_input_tokens: int
+    output_tokens: int
+
+
+def _compute_cost(usage: TotalTokenUsage, costs: CodexTokenPricing) -> float:
+    non_cached_input_tokens = (
+        usage["input_tokens"] - usage["cached_input_tokens"]
+    )
+    return (
+        non_cached_input_tokens * costs.input_mtoken_cost / 1e6
+        + usage["cached_input_tokens"] * costs.cached_input_mtoken_cost / 1e6
+        + usage["output_tokens"] * costs.output_mtoken_cost / 1e6
+    )
+
+
+class CodexResponse(NamedTuple):
+    cost: float
+    status: Literal["running", "terminating_on_max_cost", "succeeded", "terminated", "errored"]
+
+
+class CodexSession:
+    execution_dir: Path
+    console: Console
+    session_id: str | None
+    reasoning_effort: str
+    models_pricing: dict[str, CodexTokenPricing] | None
+
+    def __init__(
+        self,
+        execution_dir: Path,
+        console: Console,
+        *,
+        session_id: str | None = None,
+        reasoning_effort: str = "high",
+        models_pricing: dict[str, CodexTokenPricing] | None = None,
+    ):
+        self.execution_dir = execution_dir
+        self.console = console
+        self.session_id = session_id
+        self.reasoning_effort = reasoning_effort
+        self.models_pricing = models_pricing
+
+    def _load_session_id(self) -> None:
+        now = datetime.now()
+
+        sessions_dir = (
+            Path.home()
+            / ".codex"
+            / "sessions"
+            / now.strftime("%Y")
+            / now.strftime("%m")
+            / now.strftime("%d")
+        )
+        recent_file = max(sessions_dir.iterdir(), key=lambda x: x.stat().st_mtime)
+        parts = recent_file.stem.split("-")
+        self.session_id = "-".join(parts[-5:])
+
+    async def _setup_process(self, prompt: str, model: str) -> asyncio.subprocess.Process:
+        args = ["codex", "exec", "--json"]
+        args.append("--model")
+        args.append(model)
+
+        args.append("--cd")
+        args.append(str(self.execution_dir))
+
+        args.append("--skip-git-repo-check")
+
+        args.append("--sandbox")
+        args.append("workspace-write")
+
+        args.append("-c")
+        args.append(f'model_reasoning_effort="{self.reasoning_effort}"')
+
+        if self.session_id is not None:
+            args.append("resume")
+            args.append(self.session_id)
+
+        logger.info(f"Running {' '.join(args)}")
+
+        proc = await asyncio.create_subprocess_exec(
+            args[0],
+            *args[1:],
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            limit=100 * 1024 * 1024,  # 100MB
+        )
+
+        assert proc.stdin is not None
+
+        proc.stdin.write(prompt.encode("utf-8"))
+        proc.stdin.write_eof()
+        proc.stdin.close()
+
+        # funny thing - Codex doesn't print the session ID to stdout
+        # workaround: look into ~/.codex/sessions and figure out from there
+        # https://github.com/openai/codex/issues/3817
+        if self.session_id is None:
+            await asyncio.sleep(1)
+            self._load_session_id()
+
+        return proc
+
+    async def _receive_messages(self, proc: asyncio.subprocess.Process) -> AsyncIterator[dict[str, Any]]:
+        assert proc.stdout is not None
+        assert proc.stderr is not None
+
+        while True:
+            try:
+                line = await proc.stdout.readline()
+            except ValueError:
+                tmp = await proc.stdout.read(1024 * 1024)
+                logger.error(f"Failed to read from Codex stdout")
+                logger.error(f"artifact data:\n{tmp}")
+                raise
+
+            if not line:
+                break
+
+            msg = json.loads(line.decode("utf-8"))
+            yield msg
+
+        await proc.wait()
+
+        if proc.returncode != 0:
+            err = await proc.stderr.read()
+            raise RuntimeError(
+                f"Process failed with exit code: {proc.returncode}\n{err.decode('utf-8')}"
+            )
+
+    def _process_message(self, msg: dict[str, Any], formatter: VerboseFormatter) -> None:
+        if msg["type"] == "agent_reasoning":
+            formatter.print_thinking(msg["text"])
+        elif msg["type"] == "agent_message":
+            formatter.print_agent_message(msg["message"])
+        elif msg["type"] == "exec_command_begin":
+            formatter.print_tool_use(" ".join(msg["command"]), {})
+        elif msg["type"] == "exec_command_end":
+            if msg["exit_code"] == 0:
+                formatter.print_tool_result(msg["stdout"], False)
+            else:
+                formatter.print_tool_result(msg["stderr"], True)
+        elif msg["type"] == "mcp_tool_call_begin":
+            formatter.print_tool_use(
+                msg["invocation"]["server"] + "." + msg["invocation"]["tool"],
+                msg["invocation"]["arguments"],
+            )
+        elif msg["type"] == "mcp_tool_call_end":
+            formatter.print_tool_result(
+                msg["result"]["Ok"]["content"],
+                msg["result"]["Ok"]["isError"],
+            )
+        elif msg["type"] == "patch_apply_begin":
+            formatter.print_tool_use("patch_apply", msg["changes"])
+        elif msg["type"] == "patch_apply_end":
+            if msg["success"]:
+                formatter.print_tool_result(msg["stdout"], False)
+            else:
+                formatter.print_tool_result(msg["stderr"], True)
+        elif msg["type"] == "error":
+            # TODO: use different call?
+            formatter.print_tool_result(msg["message"], True)
+        elif msg["type"] == "exec_command_output_delta":
+            # doesn't seem very useful
+            pass
+        elif msg["type"] == "token_count":
+            # ignore
+            pass
+        elif msg["type"] == "agent_reasoning_section_break":
+            # ignore
+            pass
+        elif msg["type"] == "task_started":
+            # doesn't seem very useful
+            pass
+        elif msg["type"] == "turn_diff":
+            # ignore
+            pass
+        else:
+            logger.error(f"Unexpected Codex message type: {msg['type']}")
+
+    async def query(self, prompt: str, model: str, max_cost: float | None, formatter: VerboseFormatter) -> AsyncIterator[CodexResponse]:
+        if self.models_pricing is not None and model in self.models_pricing:
+            model_pricing = self.models_pricing[model]
+        elif model.lower() in GPT_PRICING:
+            model_pricing = GPT_PRICING[model.lower()]
+        else:
+            raise ValueError(f"No pricing found for model '{model}'. Please provide models_pricing.")
+
+        # each launched process starts counting tokens from the beginning
+        # (even if we continue an existing session)
+        proc = await self._setup_process(prompt, model)
+
+        formatter.print_user_message(prompt)
+        terminated = False
+        cost = 0.0
+
+        async for msg in self._receive_messages(proc):
+            if "msg" in msg and "type" in msg["msg"]:
+                self._process_message(msg["msg"], formatter)
+
+                if msg["msg"]["type"] == "token_count" and msg["msg"]["info"] is not None:
+                    cost = _compute_cost(
+                        msg["msg"]["info"]["total_token_usage"],
+                        model_pricing
+                    )
+                    yield CodexResponse(cost=cost, status="running")
+
+                    if max_cost is not None and cost > max_cost:
+                        proc.terminate()
+                        terminated = True
+
+        main_cost = cost
+
+        await proc.wait()
+
+        if terminated:
+            formatter.print_user_message(TERMINATION_PROMPT)
+            proc = await self._setup_process(TERMINATION_PROMPT, model)
+            cost = 0.0
+
+            async for msg in self._receive_messages(proc):
+                if "msg" in msg and "type" in msg["msg"]:
+                    self._process_message(msg["msg"], formatter)
+
+                    if msg["msg"]["type"] == "token_count" and msg["msg"]["info"] is not None:
+                        cost = _compute_cost(
+                            msg["msg"]["info"]["total_token_usage"],
+                            model_pricing
+                        )
+                        yield CodexResponse(cost=main_cost + cost, status="terminating_on_max_cost")
+
+        yield CodexResponse(cost=main_cost + cost, status="succeeded")

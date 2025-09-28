@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import rich_click as click
 import logging
 from pathlib import Path
@@ -10,10 +11,10 @@ from typing import Optional, Union, Dict, Any, Sequence, List, Type, TYPE_CHECKI
 import rich.traceback
 from rich.console import Console
 from rich.logging import RichHandler
-from wake_ai.utils.logging import get_logger, set_debug
+from wake_ai.utils.logging import get_logger, set_verbosity_level
 
 if TYPE_CHECKING:
-    from wake_ai import AIWorkflow
+    from wake_ai.core.flow import AIWorkflow
 
 
 console = Console()
@@ -144,7 +145,6 @@ class WorkflowGroup(click.RichGroup):
         return sorted(self.commands)
 
 
-# credits: https://stackoverflow.com/questions/3589311/get-defining-class-of-unbound-method-object-in-python-3/25959545#25959545
 def list_workflows(ctx: click.Context, group: WorkflowGroup) -> None:
     """Display all available workflows in a formatted table."""
     from rich.table import Table
@@ -197,45 +197,12 @@ def list_workflows(ctx: click.Context, group: WorkflowGroup) -> None:
     console.print("[dim]Get help for a workflow: wake-ai <workflow-name> --help[/dim]")
 
 
-def get_class_that_defined_method(meth):
-    import functools
-    import inspect
-
-    if isinstance(meth, functools.partial):
-        return get_class_that_defined_method(meth.func)
-    if inspect.ismethod(meth):
-        for c in inspect.getmro(meth.__self__.__class__):
-            if meth.__name__ in c.__dict__:
-                return c
-        meth = getattr(meth, "__func__", meth)  # fallback to __qualname__ parsing
-    if inspect.isfunction(meth):
-        c = getattr(
-            inspect.getmodule(meth),
-            meth.__qualname__.split(".<locals>", 1)[0].rsplit(".", 1)[0],
-            None,
-        )
-        if isinstance(c, type):
-            return c
-    return getattr(meth, "__objclass__", None)  # handle special descriptor objects
-
-
 @click.group(cls=WorkflowGroup, invoke_without_command=True)
 @click.option(
     "--working-dir",
     "-w",
     type=click.Path(),
     help="Working directory for AI workflow (defaults to .wake/ai/<session-id>)"
-)
-@click.option(
-    "--model",
-    "-m",
-    default="sonnet",
-    help="Claude model to use"
-)
-@click.option(
-    "--resume",
-    is_flag=True,
-    help="Resume from previous session"
 )
 @click.option(
     "--execution-dir",
@@ -249,20 +216,21 @@ def get_class_that_defined_method(meth):
     help="Export detections to JSON file"
 )
 @click.option(
-    "--no-cleanup/--cleanup",
-    default=None,
-    help="Don't clean up working directory after completion (default: cleanup for most workflows, keep for audit)"
+    "--cleanup/--no-cleanup",
+    is_flag=True,
+    default=False,
+    help="Clean up working directory after completion (default: no cleanup)"
 )
 @click.option(
     "--verbose",
     "-v",
-    is_flag=True,
-    help="Enable verbose logging (debug level)"
+    count=True,
+    help="Enable verbose logging (-v: info, -vv: debug, -vvv: trace)"
 )
 @click.option(
     "--no-progress",
     is_flag=True,
-    help="Disable progress bar during workflow execution"
+    help="Disable progress display during workflow execution"
 )
 @click.option(
     "--list",
@@ -270,8 +238,14 @@ def get_class_that_defined_method(meth):
     is_flag=True,
     help="List all available workflows"
 )
+@click.option(
+    "--max-parallel-steps",
+    "-M",
+    type=int,
+    help="Maximum number of parallel steps to run"
+)
 @click.pass_context
-def main(ctx: click.Context, working_dir: str | None, model: str, resume: bool, execution_dir: str | None, export: str | None, no_cleanup: bool, verbose: bool, no_progress: bool, list: bool):
+def main(ctx: click.Context, working_dir: str | None, execution_dir: str | None, export: str | None, cleanup: bool, verbose: int, no_progress: bool, list: bool, max_parallel_steps: int | None):
     """AI-powered smart contract security analysis.
 
     This command runs various AI workflows for smart contract analysis
@@ -281,8 +255,13 @@ def main(ctx: click.Context, working_dir: str | None, model: str, resume: bool, 
 
     # Set logging level based on verbose flag
     if verbose:
-        set_debug(True)
-        console.print("[dim]Debug logging enabled[/dim]")
+        set_verbosity_level(verbose)
+        if verbose == 1:
+            console.print("[dim]Verbose logging enabled (info level)[/dim]")
+        elif verbose == 2:
+            console.print("[dim]Debug logging enabled[/dim]")
+        elif verbose >= 3:
+            console.print("[dim]Trace logging enabled (maximum verbosity)[/dim]")
 
     # Handle list flag
     if list:
@@ -298,10 +277,9 @@ def main(ctx: click.Context, working_dir: str | None, model: str, resume: bool, 
     if ctx.invoked_subcommand is not None:
         ctx.ensure_object(dict)
         ctx.obj["name"] = ctx.invoked_subcommand
-        ctx.obj["model"] = model
         ctx.obj["working_dir"] = working_dir
         ctx.obj["execution_dir"] = execution_dir
-        ctx.obj["cleanup_working_dir"] = not no_cleanup
+        ctx.obj["cleanup_working_dir"] = cleanup
         ctx.obj["show_progress"] = not no_progress
         ctx.obj["console"] = console  # Pass console for coordinated output
 
@@ -309,8 +287,9 @@ def main(ctx: click.Context, working_dir: str | None, model: str, resume: bool, 
 if __name__ == "__main__":
     main()
 
+
 @main.result_callback()
-def factory_callback(workflow: Optional[AIWorkflow], model: str, resume: bool, working_dir: str | None, execution_dir: str | None, no_cleanup: bool, export: str | None, no_progress: bool, **kwargs):
+def factory_callback(workflow: Optional[AIWorkflow], working_dir: str | None, execution_dir: str | None, cleanup: bool, export: str | None, no_progress: bool, max_parallel_steps: int | None, **kwargs):
     ctx = click.get_current_context()
     workflow_name = ctx.invoked_subcommand
 
@@ -324,42 +303,28 @@ def factory_callback(workflow: Optional[AIWorkflow], model: str, resume: bool, w
 
         # Display working directory and cleanup info
         console.print(f"[blue]Working directory:[/blue] {workflow.working_dir}")
-        if workflow.cleanup_working_dir:
-            console.print(f"[dim]Working directory will be cleaned up after completion. Use --no-cleanup to preserve it.[/dim]")
+        if cleanup:
+            console.print(f"[dim]Working directory will be cleaned up after completion[/dim]")
         else:
-            console.print(f"[dim]Working directory will be preserved after completion.[/dim]")
+            console.print(f"[dim]Working directory will be preserved after completion. Use --cleanup to clean it up.[/dim]")
 
         # Execute workflow
-        results, formatted_results = workflow.execute(resume=resume)
+        result = asyncio.run(workflow.execute(max_parallel_steps=max_parallel_steps))
 
         # Display results
         console.print("\n[green]Workflow complete![/green]")
 
-
         if export:
             # Export to JSON
-            if hasattr(formatted_results, 'export_json'):
-                import json
-                results = {
-                    "results": formatted_results.to_dict(),
-                    "metadata": results["metadata"],
-                }
-                Path(export).parent.mkdir(parents=True, exist_ok=True)
-                Path(export).write_text(json.dumps(results, indent=2))
-                console.print(f"[green]Results exported to:[/green] {export}")
+            result.export_json(Path(export))
+            console.print(f"[green]Results exported to:[/green] {export}")
         else:
             # Pretty print to console
             # results["metadata"] content is already shown as table in the command output.
-            if hasattr(formatted_results, 'pretty_print'):
-                formatted_results.pretty_print(console)
-            else:
-                console.print(formatted_results)
+            result.pretty_print(console)
 
     except KeyboardInterrupt:
-        console.print("\n[yellow]Workflow interrupted. Use --resume to continue.[/yellow]")
         ctx.exit(0)
     except Exception as e:
         console.print_exception()
-        if resume:
-            console.print("[yellow]Try running without --resume flag[/yellow]")
         ctx.exit(1)
