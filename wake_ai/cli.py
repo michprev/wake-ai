@@ -11,7 +11,7 @@ from typing import Optional, Union, Dict, Any, Sequence, List, Type, TYPE_CHECKI
 import rich.traceback
 from rich.console import Console
 from rich.logging import RichHandler
-from wake_ai.utils.logging import get_logger, set_verbosity_level
+from wake_ai.utils.logging import get_logger, set_verbosity_level, set_verbose_filter
 
 if TYPE_CHECKING:
     from wake_ai.core.flow import AIWorkflow
@@ -228,6 +228,11 @@ def list_workflows(ctx: click.Context, group: WorkflowGroup) -> None:
     help="Enable verbose logging (-v: info, -vv: debug, -vvv: trace)"
 )
 @click.option(
+    "--verbose-filter",
+    type=str,
+    help="Filter verbose logging to only show messages matching the given regex (comma-separated, e.g. 'user,agent,thinking,system,tool,tool_result,todo')"
+)
+@click.option(
     "--no-progress",
     is_flag=True,
     help="Disable progress display during workflow execution"
@@ -245,7 +250,7 @@ def list_workflows(ctx: click.Context, group: WorkflowGroup) -> None:
     help="Maximum number of parallel steps to run"
 )
 @click.pass_context
-def main(ctx: click.Context, working_dir: str | None, execution_dir: str | None, export: str | None, cleanup: bool, verbose: int, no_progress: bool, list: bool, max_parallel_steps: int | None):
+def main(ctx: click.Context, working_dir: str | None, execution_dir: str | None, export: str | None, cleanup: bool, verbose: int, no_progress: bool, list: bool, max_parallel_steps: int | None, profile: bool):
     """AI-powered smart contract security analysis.
 
     This command runs various AI workflows for smart contract analysis
@@ -262,6 +267,9 @@ def main(ctx: click.Context, working_dir: str | None, execution_dir: str | None,
             console.print("[dim]Debug logging enabled[/dim]")
         elif verbose >= 3:
             console.print("[dim]Trace logging enabled (maximum verbosity)[/dim]")
+
+    if verbose_filter:
+        set_verbose_filter(set(verbose_filter.split(",")))
 
     # Handle list flag
     if list:

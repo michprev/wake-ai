@@ -5,6 +5,8 @@ from typing import Any
 from rich.console import Console
 from rich.rule import Rule
 
+from ..utils.logging import should_verbose_log
+
 COLORS = {
     "todo_header": "bold blue",
     "todo_complete": "bold green",
@@ -15,12 +17,11 @@ COLORS = {
     "tool_result": "bright_cyan",
     "tool_result_json": "cyan",
     "tool_error": "bold red",
-    "system_msg": "purple",
-    "user_message": "bold white",
-    "agent_message": "white",
+    "system": "purple",
+    "user": "bold white",
+    "agent": "white",
     "thinking": "dim white",
     "unknown": "dim red",
-    "truncation": "dim italic yellow",
 }
 # TODO customizable style
 
@@ -45,11 +46,11 @@ class VerboseFormatter:
                 f.write(f"User: {message}\n")
                 f.write(self.file_splitter)
 
-        if self.verbosity == 0:
+        if self.verbosity == 0 or not should_verbose_log("user"):
             return
 
         self.console.print(self.splitter)
-        self.console.print("User: " + message, style=COLORS["user_message"], markup=False)
+        self.console.print("User: " + message, style=COLORS["user"], markup=False)
 
     def print_agent_message(self, message: str) -> None:
         if self.log_file is not None:
@@ -57,11 +58,11 @@ class VerboseFormatter:
                 f.write(f"Agent: {message}\n")
                 f.write(self.file_splitter)
 
-        if self.verbosity == 0:
+        if self.verbosity == 0 or not should_verbose_log("agent"):
             return
 
         self.console.print(self.splitter)
-        self.console.print("Agent: " + message, style=COLORS["agent_message"], markup=False)
+        self.console.print("Agent: " + message, style=COLORS["agent"], markup=False)
 
     def print_thinking(self, message: str) -> None:
         if self.log_file is not None:
@@ -69,7 +70,7 @@ class VerboseFormatter:
                 f.write(f"Thinking: {message}\n")
                 f.write(self.file_splitter)
 
-        if self.verbosity == 0:
+        if self.verbosity == 0 or not should_verbose_log("thinking"):
             return
 
         self.console.print(self.splitter)
@@ -81,11 +82,11 @@ class VerboseFormatter:
                 f.write(f"System: {message}\n")
                 f.write(self.file_splitter)
 
-        if self.verbosity == 0:
+        if self.verbosity == 0 or not should_verbose_log("system"):
             return
 
         self.console.print(self.splitter)
-        self.console.print("System: " + message, style=COLORS["system_msg"], markup=False)
+        self.console.print("System: " + message, style=COLORS["system"], markup=False)
 
     def print_tool_use(self, name: str, input: dict[str, Any]) -> None:
         if self.log_file is not None:
@@ -95,7 +96,7 @@ class VerboseFormatter:
                     f.write(json.dumps(input, indent=2) + "\n")
                 f.write(self.file_splitter)
 
-        if self.verbosity == 0:
+        if self.verbosity == 0 or not should_verbose_log("tool"):
             return
 
         self.console.print(self.splitter)
@@ -117,7 +118,7 @@ class VerboseFormatter:
                     f.write(json.dumps(result, indent=2) + "\n")
                 f.write(self.file_splitter)
 
-        if self.verbosity < 2:
+        if self.verbosity < 2 or not should_verbose_log("tool_result"):
             return
 
         style = COLORS["tool_result"] if not is_error else COLORS["tool_error"]
@@ -149,7 +150,7 @@ class VerboseFormatter:
                     f.write(f"  {todo['status']}: {todo['content']}\n")
                 f.write(self.file_splitter)
 
-        if self.verbosity == 0:
+        if self.verbosity == 0 or not should_verbose_log("todo"):
             return
 
         self.console.print(self.splitter)
