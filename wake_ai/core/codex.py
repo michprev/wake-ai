@@ -95,7 +95,7 @@ class CodexSession:
         self.session_id = "-".join(parts[-5:])
 
     async def _setup_process(self, prompt: str, model: str) -> asyncio.subprocess.Process:
-        args = ["codex", "exec", "--json"]
+        args = ["codex", "exec", "--experimental-json"]
         args.append("--model")
         args.append(model)
 
@@ -134,9 +134,9 @@ class CodexSession:
         # funny thing - Codex doesn't print the session ID to stdout
         # workaround: look into ~/.codex/sessions and figure out from there
         # https://github.com/openai/codex/issues/3817
-        if self.session_id is None:
-            await asyncio.sleep(1)
-            self._load_session_id()
+        #if self.session_id is None:
+            #await asyncio.sleep(1)
+            #self._load_session_id()
 
         return proc
 
@@ -166,6 +166,40 @@ class CodexSession:
             raise RuntimeError(
                 f"Process failed with exit code: {proc.returncode}\n{err.decode('utf-8')}"
             )
+
+    def _process_experiment_message(self, msg: dict[str, Any], formatter: VerboseFormatter) -> None:
+        if msg["type"] == "session.created":
+            if self.session_id is None:
+                self.session_id = msg["session_id"]
+            else:
+                assert self.session_id == msg["session_id"]
+        elif msg["type"] == "error":
+            formatter.print_tool_result(msg["message"], True)
+        elif msg["type"] == "item.started":
+            if msg["item"]["item_type"] == "command_execution":
+                formatter.print_tool_use(msg["item"]["command"], {})
+            else:
+                logger.warning(f"Unexpected Codex item.started message: {msg}")
+        elif msg["type"] == "item.completed":
+            if msg["item"]["item_type"] == "assistant_message":
+                formatter.print_agent_message(msg["item"]["text"])
+            elif msg["item"]["item_type"] == "reasoning":
+                formatter.print_thinking(msg["item"]["text"])
+            elif msg["item"]["item_type"] == "command_execution":
+                formatter.print_tool_result(
+                    msg["item"]["aggregated_output"],
+                    msg["item"]["exit_code"] != 0,
+                )
+            elif msg["item"]["item_type"] == "file_change":
+                changes = msg["item"]["changes"]
+                message = "Changed files:\n" + "\n".join(ch["path"] + " " + ch["kind"] for ch in changes)
+                formatter.print_system_message(message)
+            else:
+                logger.warning(f"Unexpected Codex item.completed message: {msg}")
+        else:
+            logger.warning(f"Unexpected Codex message: {msg}")
+
+        return
 
     def _process_message(self, msg: dict[str, Any], formatter: VerboseFormatter) -> None:
         if msg["type"] == "agent_reasoning":
@@ -234,19 +268,18 @@ class CodexSession:
         cost = 0.0
 
         async for msg in self._receive_messages(proc):
-            if "msg" in msg and "type" in msg["msg"]:
-                self._process_message(msg["msg"], formatter)
+            self._process_experiment_message(msg, formatter)
 
-                if msg["msg"]["type"] == "token_count" and msg["msg"]["info"] is not None:
-                    cost = _compute_cost(
-                        msg["msg"]["info"]["total_token_usage"],
-                        model_pricing
-                    )
-                    yield CodexResponse(cost=cost, status="running")
+            if False and msg["msg"]["type"] == "token_count" and msg["msg"]["info"] is not None:
+                cost = _compute_cost(
+                    msg["msg"]["info"]["total_token_usage"],
+                    model_pricing
+                )
+                yield CodexResponse(cost=cost, status="running")
 
-                    if max_cost is not None and cost > max_cost:
-                        proc.terminate()
-                        terminated = True
+                if max_cost is not None and cost > max_cost:
+                    proc.terminate()
+                    terminated = True
 
         main_cost = cost
 
@@ -258,14 +291,13 @@ class CodexSession:
             cost = 0.0
 
             async for msg in self._receive_messages(proc):
-                if "msg" in msg and "type" in msg["msg"]:
-                    self._process_message(msg["msg"], formatter)
+                self._process_experiment_message(msg, formatter)
 
-                    if msg["msg"]["type"] == "token_count" and msg["msg"]["info"] is not None:
-                        cost = _compute_cost(
-                            msg["msg"]["info"]["total_token_usage"],
-                            model_pricing
-                        )
-                        yield CodexResponse(cost=main_cost + cost, status="terminating_on_max_cost")
+                if False and msg["msg"]["type"] == "token_count" and msg["msg"]["info"] is not None:
+                    cost = _compute_cost(
+                        msg["msg"]["info"]["total_token_usage"],
+                        model_pricing
+                    )
+                    yield CodexResponse(cost=main_cost + cost, status="terminating_on_max_cost")
 
         yield CodexResponse(cost=main_cost + cost, status="succeeded")
