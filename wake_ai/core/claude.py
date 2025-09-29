@@ -89,10 +89,10 @@ class ClaudeSession:
                     if isinstance(content, TextBlock):
                         formatter.print_user_message(content.text)
                     elif isinstance(content, ToolResultBlock):
-                        if content.content is None or content.is_error is None:
+                        if content.content is None:
                             logger.warning(f"Unexpected Claude tool result content: {content}")
                             continue
-                        formatter.print_tool_result(content.content, content.is_error)
+                        formatter.print_tool_result(content.content, content.is_error or False)
                     else:
                         logger.warning(f"Unexpected Claude user content type: {type(content)}")
         elif isinstance(message, AssistantMessage):
@@ -107,10 +107,10 @@ class ClaudeSession:
                     else:
                         formatter.print_tool_use(content.name, content.input)
                 elif isinstance(content, ToolResultBlock):
-                    if content.content is None or content.is_error is None:
+                    if content.content is None:
                         logger.warning(f"Unexpected Claude tool result content: {content}")
                         continue
-                    formatter.print_tool_result(content.content, content.is_error)
+                    formatter.print_tool_result(content.content, content.is_error or False)
                 else:
                     logger.warning(f"Unexpected Claude assistant content type: {type(content)}")
         elif isinstance(message, SystemMessage):
