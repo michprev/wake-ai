@@ -250,7 +250,7 @@ def list_workflows(ctx: click.Context, group: WorkflowGroup) -> None:
     help="Maximum number of parallel steps to run"
 )
 @click.pass_context
-def main(ctx: click.Context, working_dir: str | None, execution_dir: str | None, export: str | None, cleanup: bool, verbose: int, no_progress: bool, list: bool, max_parallel_steps: int | None, profile: bool):
+def main(ctx: click.Context, working_dir: str | None, execution_dir: str | None, export: str | None, cleanup: bool, verbose: int, verbose_filter: str | None, no_progress: bool, list: bool, max_parallel_steps: int | None):
     """AI-powered smart contract security analysis.
 
     This command runs various AI workflows for smart contract analysis
