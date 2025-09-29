@@ -160,16 +160,15 @@ class ClaudeSession:
                 result = message
 
         assert result is not None
+        total_cost += result.total_cost_usd or 0.0
+        result = None
 
         if options.resume is None:
             # from now on we must keep using the same session id
             options.resume = self.session_id
 
         while result.subtype == "error_max_turns" and (max_cost is None or total_cost < max_cost):
-            total_cost += result.total_cost_usd or 0.0
             yield ClaudeResponse(cost=total_cost, status="running")
-
-            result = None
 
             formatter.print_user_message("continue")
 
@@ -180,14 +179,15 @@ class ClaudeSession:
                     result = message
 
             assert result is not None
+            total_cost += result.total_cost_usd or 0.0
+            result = None
 
         termination_attempt = 0
         while result.subtype == "error_max_turns" and termination_attempt < MAX_TERMINATION_ATTEMPTS:
             termination_attempt += 1
-            total_cost += result.total_cost_usd or 0.0
+            result = None
             yield ClaudeResponse(cost=total_cost, status="terminating_on_max_cost")
 
-            result = None
             termination_prompt = TERMINATION_PROMPT.format(finish_tries=termination_attempt, max_finish_tries=MAX_TERMINATION_ATTEMPTS)
 
             formatter.print_user_message(termination_prompt)
@@ -199,8 +199,7 @@ class ClaudeSession:
                     result = message
 
             assert result is not None
-
-        total_cost += result.total_cost_usd or 0.0
+            total_cost += result.total_cost_usd or 0.0
 
         if result.subtype == "success":
             yield ClaudeResponse(cost=total_cost, status="succeeded")
