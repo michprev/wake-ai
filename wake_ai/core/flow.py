@@ -205,12 +205,6 @@ class AIWorkflow(ABC):
     def cumulative_cost(self) -> float:
         return sum(step.cost for step in self.steps)
 
-    def _pre_step_hook(self, step: WorkflowStep) -> None:
-        pass
-
-    def _post_step_hook(self, step: WorkflowStep) -> None:
-        pass
-
     @require_initialized
     def add_step(
         self,
@@ -303,8 +297,6 @@ class AIWorkflow(ABC):
         if step.pre_hook is not None:
             step.pre_hook(step)
 
-        self._pre_step_hook(step)
-
         # main prompt query
         async for info in step.session.query(
             step.format_prompt(self.context),
@@ -344,8 +336,6 @@ class AIWorkflow(ABC):
 
         if step.post_hook is not None:
             step.post_hook(step)
-
-        self._post_step_hook(step)
 
     @abstractmethod
     def collect_result(self) -> AIResult:
