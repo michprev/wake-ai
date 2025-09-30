@@ -414,6 +414,7 @@ class AIWorkflow(ABC):
             width=80,
         )
         table.add_column("Step", no_wrap=True, width=40)
+        table.add_column("Model", no_wrap=True, width=25)
         table.add_column("Time", justify="right", width=15)
         table.add_column("Cost", justify="right", width=12)
 
@@ -451,7 +452,7 @@ class AIWorkflow(ABC):
             # Format cost
             cost = f"${step.cost:.4f}" if step.cost > 0 else "-"
 
-            table.add_row(step_name, duration, cost, style=row_style)
+            table.add_row(step_name, step.model, duration, cost, style=row_style)
 
         # Add total row
         total_cost = sum(step.cost for step in self.steps)
@@ -459,6 +460,7 @@ class AIWorkflow(ABC):
         table.add_section()
         table.add_row(
             "Total",
+            "",
             f"{_format_duration((datetime.now() - self.start_time).total_seconds())}",
             f"${total_cost:.4f}",
             style="bold",
