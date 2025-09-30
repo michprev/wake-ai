@@ -35,7 +35,7 @@ dependencies = [
     "pydantic>=2.0",
     "eth-wake>=4.20.0",
     "rich-click>=1.8.9",
-    "claude-code-sdk>=0.0.20",
+    "claude-agent-sdk>=0.1.0",
 ]
 
 [project.optional-dependencies]

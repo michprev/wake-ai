@@ -1,7 +1,8 @@
 from pathlib import Path
 from typing import AsyncIterator, NamedTuple, Literal
 
-from claude_code_sdk import AssistantMessage, ClaudeCodeOptions, Message, ResultMessage, SystemMessage, TextBlock, ThinkingBlock, ToolResultBlock, ToolUseBlock, UserMessage, query
+from claude_agent_sdk import AssistantMessage, ClaudeAgentOptions, Message, ResultMessage, SystemMessage, TextBlock, ThinkingBlock, ToolResultBlock, ToolUseBlock, UserMessage, query
+from claude_agent_sdk.types import SystemPromptPreset
 
 from .verbose_formatter import VerboseFormatter
 from ..utils.logging import get_logger
@@ -137,7 +138,8 @@ class ClaudeSession:
             logger.warning(f"Unexpected Claude message type: {type(message)}")
 
     async def query(self, prompt: str, model: str, max_cost: float | None, formatter: VerboseFormatter) -> AsyncIterator[ClaudeResponse]:
-        options = ClaudeCodeOptions(
+        options = ClaudeAgentOptions(
+            system_prompt=SystemPromptPreset(type="preset", preset="claude_code"),
             allowed_tools=self.allowed_tools,
             disallowed_tools=self.disallowed_tools,
             resume=self.session_id,
