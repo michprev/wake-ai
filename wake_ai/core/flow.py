@@ -42,18 +42,6 @@ def _format_duration(seconds: float) -> str:
         return f"{secs:.2f}s"
 
 
-def conditionally_cleanup(func):
-    @wraps(func)
-    def wrapper(self: AIWorkflow, *args, **kwargs):
-        try:
-            return func(self, *args, **kwargs)
-        finally:
-            if self.cleanup_working_dir and self.working_dir.exists():
-                shutil.rmtree(self.working_dir)
-
-    return wrapper
-
-
 def require_initialized(func):
     """Decorator to ensure __init__ was called on AIWorkflow instances."""
 
@@ -342,67 +330,70 @@ class AIWorkflow(ABC):
         ...
 
     @require_initialized
-    @conditionally_cleanup
     async def execute(
         self,
         *,
         max_parallel_steps: int | None = None,
     ) -> AIResult:
-        running: dict[asyncio.Task, WorkflowStep] = {}
+        try:
+            running: dict[asyncio.Task, WorkflowStep] = {}
 
-        self.start_time = datetime.now()
+            self.start_time = datetime.now()
 
-        ctx = nullcontext() if not self.show_progress else Live(
-            self._get_status_display(),
-            refresh_per_second=10,
-            auto_refresh=True,
-            console=self.console,
-            transient=True,
-            get_renderable=self._get_status_display,
-        )
+            ctx = nullcontext() if not self.show_progress else Live(
+                self._get_status_display(),
+                refresh_per_second=10,
+                auto_refresh=True,
+                console=self.console,
+                transient=True,
+                get_renderable=self._get_status_display,
+            )
 
-        with ctx as live:
-            while any(step.status in ["pending", "running"] for step in self._sorted_steps):
-                # Start all ready steps that can run
-                for step in self._sorted_steps:
-                    if max_parallel_steps is not None and len(running) >= max_parallel_steps:
-                        break
+            with ctx as live:
+                while any(step.status in ["pending", "running"] for step in self._sorted_steps):
+                    # Start all ready steps that can run
+                    for step in self._sorted_steps:
+                        if max_parallel_steps is not None and len(running) >= max_parallel_steps:
+                            break
 
-                    if (
-                        step.status == "pending" and
-                        all(r.status in ["completed", "skipped"] for r in step.requires)
-                    ):
-                        same_session_steps = [s for s in running.values() if s.session == step.session]
-                        if same_session_steps:
-                            raise RuntimeError(f"Step {step.name} shares the same session with steps: {', '.join(s.name for s in same_session_steps)}; and so cannot run in parallel")
+                        if (
+                            step.status == "pending" and
+                            all(r.status in ["completed", "skipped"] for r in step.requires)
+                        ):
+                            same_session_steps = [s for s in running.values() if s.session == step.session]
+                            if same_session_steps:
+                                raise RuntimeError(f"Step {step.name} shares the same session with steps: {', '.join(s.name for s in same_session_steps)}; and so cannot run in parallel")
 
-                        skipped_requires = [r for r in step.requires if r.status == "skipped"]
-                        if skipped_requires:
-                            raise RuntimeError(f"Step {step.name} has skipped requires: {', '.join(r.name for r in skipped_requires)}; and so cannot run")
+                            skipped_requires = [r for r in step.requires if r.status == "skipped"]
+                            if skipped_requires:
+                                raise RuntimeError(f"Step {step.name} has skipped requires: {', '.join(r.name for r in skipped_requires)}; and so cannot run")
 
-                        if step.condition is not None and not step.condition(step):
-                            step.status = "skipped"
-                            step.start_time = datetime.now()
-                            step.end_time = step.start_time
-                        else:
-                            task = asyncio.create_task(self._execute_step(step))
-                            step.status = "running"
-                            step.start_time = datetime.now()
-                            running[task] = step
+                            if step.condition is not None and not step.condition(step):
+                                step.status = "skipped"
+                                step.start_time = datetime.now()
+                                step.end_time = step.start_time
+                            else:
+                                task = asyncio.create_task(self._execute_step(step))
+                                step.status = "running"
+                                step.start_time = datetime.now()
+                                running[task] = step
 
-                # Wait for at least one to complete
-                if running:
-                    done, _ = await asyncio.wait(running.keys(), return_when=asyncio.FIRST_COMPLETED)
-                    for task in done:
-                        step = running.pop(task)
-                        step.status = "completed" if task.exception() is None else "failed"
-                        step.end_time = datetime.now()
-                        if task.exception():
-                            raise task.exception()
+                    # Wait for at least one to complete
+                    if running:
+                        done, _ = await asyncio.wait(running.keys(), return_when=asyncio.FIRST_COMPLETED)
+                        for task in done:
+                            step = running.pop(task)
+                            step.status = "completed" if task.exception() is None else "failed"
+                            step.end_time = datetime.now()
+                            if task.exception():
+                                raise task.exception()
 
-        self.console.print(self._get_status_display())
+            return self.collect_result()
+        finally:
+            self.console.print(self._get_status_display())
 
-        return self.collect_result()
+            if self.cleanup_working_dir and self.working_dir.exists():
+                shutil.rmtree(self.working_dir)
 
     def _get_status_display(self) -> Panel:
         """Build the status display with table and progress."""
