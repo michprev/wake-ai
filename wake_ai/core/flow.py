@@ -116,8 +116,6 @@ class AIWorkflow(ABC):
     steps: list[WorkflowStep]
     context: dict[str, Any]
 
-    # cached topologically sorted steps
-    _sorted_steps: list[WorkflowStep]
     _init_called: bool
 
     def __init__(
@@ -186,7 +184,6 @@ class AIWorkflow(ABC):
 
         self.steps = []
         self.context = {}
-        self._sorted_steps = []
         self._init_called = True
 
     @property
@@ -246,7 +243,7 @@ class AIWorkflow(ABC):
         self.steps.append(step)
 
         # Update sorted steps using our own topological sort
-        self._sorted_steps = self._find_topological_order()
+        self.steps = self._find_topological_order()
 
         return step
 
@@ -350,9 +347,9 @@ class AIWorkflow(ABC):
             )
 
             with ctx as live:
-                while any(step.status in ["pending", "running"] for step in self._sorted_steps):
+                while any(step.status in ["pending", "running"] for step in self.steps):
                     # Start all ready steps that can run
-                    for step in self._sorted_steps:
+                    for step in self.steps:
                         if max_parallel_steps is not None and len(running) >= max_parallel_steps:
                             break
 
@@ -410,7 +407,7 @@ class AIWorkflow(ABC):
         table.add_column("Cost", justify="right", width=12)
 
         # Add rows for each step
-        for step in self._sorted_steps:
+        for step in self.steps:
             # Determine row style based on status
             if step.status == "pending":
                 row_style = "dim"
