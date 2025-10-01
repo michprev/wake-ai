@@ -74,6 +74,7 @@ class WorkflowStep:
     post_hook: Callable[[WorkflowStep], None] | None
     condition: Callable[[WorkflowStep], bool] | None
     formatter: VerboseFormatter
+    additional_context: dict[str, Any]
 
     # mutable
     status: Literal["pending", "running", "completed", "failed", "skipped"]
@@ -91,11 +92,11 @@ class WorkflowStep:
 
         # Warn if there are context keys that are not in the context
         for key in prompt_context_keys:
-            if key not in context:
+            if key not in context and key not in self.additional_context:
                 print(f"Context key '{key}' used in step '{self.name}' not provided")
 
         template = env.from_string(self.prompt)
-        return template.render(**context)
+        return template.render(**context, **self.additional_context)
 
     def __hash__(self) -> int:
         # Hash based on immutable fields only
@@ -208,6 +209,7 @@ class AIWorkflow(ABC):
         post_hook: Callable[[WorkflowStep], None] | None = None,
         condition: Callable[[WorkflowStep], bool] | None = None,
         formatter: VerboseFormatter | None = None,
+        additional_context: dict[str, Any] | None = None,
     ) -> WorkflowStep:
         """
         Validation retry always uses the same session.
@@ -239,6 +241,7 @@ class AIWorkflow(ABC):
             formatter=(
                 formatter or VerboseFormatter(self.console, name, self.working_dir / f"{name}.log", get_verbosity_level())
             ),
+            additional_context=additional_context or {},
         )
         self.steps.append(step)
 
