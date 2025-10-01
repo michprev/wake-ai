@@ -164,6 +164,7 @@ class ClaudeSession:
         assert result is not None
         total_cost += result.total_cost_usd or 0.0
 
+        assert self.session_id is not None
         if options.resume is None:
             # from now on we must keep using the same session id
             options.resume = self.session_id

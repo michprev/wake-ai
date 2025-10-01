@@ -281,6 +281,8 @@ class CodexSession:
                     proc.terminate()
                     terminated = True
 
+        assert self.session_id is not None
+
         main_cost = cost
 
         await proc.wait()
