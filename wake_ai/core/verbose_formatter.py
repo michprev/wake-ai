@@ -1,6 +1,6 @@
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict, Literal
 
 from rich.console import Console
 from rich.rule import Rule
@@ -24,6 +24,11 @@ COLORS = {
     "unknown": "dim red",
 }
 # TODO customizable style
+
+
+class TodoItem(TypedDict):
+    status: Literal["completed", "in_progress", "pending"]
+    text: str
 
 
 class VerboseFormatter:
@@ -142,12 +147,12 @@ class VerboseFormatter:
         else:
             print_single(result)
 
-    def print_todo(self, todos: list[dict[str, Any]]) -> None:
+    def print_todo(self, todos: list[TodoItem]) -> None:
         if self.log_file is not None:
             with open(self.log_file, "a") as f:
                 f.write("Todo: list\n")
                 for todo in todos:
-                    f.write(f"  {todo['status']}: {todo['content']}\n")
+                    f.write(f"  {todo['status']}: {todo['text']}\n")
                 f.write(self.file_splitter)
 
         if self.verbosity == 0 or not should_verbose_log("todo"):
@@ -159,17 +164,11 @@ class VerboseFormatter:
             highlight=False,
         )
         for todo in todos:
-            status = todo.get("status", "pending")
-            if status == "in_progress" and "activeForm" in todo:
-                content = todo["activeForm"]
-            else:
-                content = todo.get("content", "")
-
             # Select appropriate visual indicators for each status type
-            if status == "completed":
+            if todo["status"] == "completed":
                 icon = "✅"
                 style = COLORS["todo_complete"]
-            elif status == "in_progress":
+            elif todo["status"] == "in_progress":
                 icon = "🔄"
                 style = COLORS["todo_progress"]
             else:  # pending
@@ -177,5 +176,5 @@ class VerboseFormatter:
                 style = COLORS["todo_pending"]
 
             self.console.print(
-                f"  {icon} {content}", highlight=False, style=style
+                f"  {icon} {todo['text']}", highlight=False, style=style
             )

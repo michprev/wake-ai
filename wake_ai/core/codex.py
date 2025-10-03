@@ -18,22 +18,6 @@ TERMINATION_PROMPT = (
     "You are approaching the cost limit. Please finish the task as quickly as possible."
 )
 
-COLORS = {
-    "todo_header": "bold blue",
-    "todo_complete": "bold green",
-    "todo_progress": "yellow",
-    "todo_pending": "dim white",
-    "tool_use": "bright_magenta",
-    "tool_input": "magenta",
-    "tool_result": "bright_cyan",
-    "tool_result_json": "cyan",
-    "tool_error": "bold red",
-    "system_msg": "purple",
-    "thinking": "white",
-    "unknown": "dim red",
-    "truncation": "dim italic yellow",
-}
-
 
 class TotalTokenUsage(TypedDict):
     input_tokens: int
@@ -95,9 +79,11 @@ class CodexSession:
         self.session_id = "-".join(parts[-5:])
 
     async def _setup_process(self, prompt: str, model: str) -> asyncio.subprocess.Process:
-        args = ["codex", "exec", "--experimental-json"]
+        args = ["codex", "exec", "--json"]
         args.append("--model")
         args.append(model)
+
+        args.append("--include-plan-tool")
 
         args.append("--cd")
         args.append(str(self.execution_dir))
@@ -167,89 +153,68 @@ class CodexSession:
                 f"Process failed with exit code: {proc.returncode}\n{err.decode('utf-8')}"
             )
 
-    def _process_experiment_message(self, msg: dict[str, Any], formatter: VerboseFormatter) -> None:
-        if msg["type"] == "session.created":
-            if self.session_id is None:
-                self.session_id = msg["session_id"]
-            else:
-                assert self.session_id == msg["session_id"]
-        elif msg["type"] == "error":
+    def _process_message(self, msg: dict[str, Any], formatter: VerboseFormatter) -> None:
+        if msg["type"] == "error":
             formatter.print_tool_result(msg["message"], True)
         elif msg["type"] == "item.started":
-            if msg["item"]["item_type"] == "command_execution":
+            if msg["item"]["type"] == "command_execution":
                 formatter.print_tool_use(msg["item"]["command"], {})
+            elif msg["item"]["type"] == "mcp_tool_call":
+                formatter.print_tool_use(
+                    msg["item"]["server"] + "." + msg["item"]["tool"],
+                    {},  # TODO!!
+                )
+            elif msg["item"]["type"] == "todo_list":
+                formatter.print_todo([
+                    {
+                        "status": "pending" if not i["completed"] else "completed",
+                        "text": i["text"],
+                    }
+                    for i in msg["item"]["items"]
+                ])
             else:
                 logger.warning(f"Unexpected Codex item.started message: {msg}")
+        elif msg["type"] == "item.updated":
+            if msg["item"]["type"] == "todo_list":
+                formatter.print_todo([
+                    {
+                        "status": "pending" if not i["completed"] else "completed",
+                        "text": i["text"],
+                    }
+                    for i in msg["item"]["items"]
+                ])
+            else:
+                logger.warning(f"Unexpected Codex item.updated message: {msg}")
         elif msg["type"] == "item.completed":
-            if msg["item"]["item_type"] == "assistant_message":
+            if msg["item"]["type"] == "agent_message":
                 formatter.print_agent_message(msg["item"]["text"])
-            elif msg["item"]["item_type"] == "reasoning":
+            elif msg["item"]["type"] == "reasoning":
                 formatter.print_thinking(msg["item"]["text"])
-            elif msg["item"]["item_type"] == "command_execution":
+            elif msg["item"]["type"] == "command_execution":
                 formatter.print_tool_result(
                     msg["item"]["aggregated_output"],
                     msg["item"]["exit_code"] != 0,
                 )
-            elif msg["item"]["item_type"] == "file_change":
+            elif msg["item"]["type"] == "file_change":
                 changes = msg["item"]["changes"]
                 message = "Changed files:\n" + "\n".join(ch["path"] + " " + ch["kind"] for ch in changes)
                 formatter.print_system_message(message)
+            elif msg["item"]["type"] == "mcp_tool_call":
+                # no new info, pass for now
+                pass  # TODO!!
             else:
                 logger.warning(f"Unexpected Codex item.completed message: {msg}")
+        elif msg["type"] == "thread.started":
+            if self.session_id is None:
+                self.session_id = msg["thread_id"]
+            else:
+                assert self.session_id == msg["thread_id"]
+        elif msg["type"] == "turn.started":
+            pass
+        elif msg["type"] == "turn.completed":
+            pass
         else:
             logger.warning(f"Unexpected Codex message: {msg}")
-
-        return
-
-    def _process_message(self, msg: dict[str, Any], formatter: VerboseFormatter) -> None:
-        if msg["type"] == "agent_reasoning":
-            formatter.print_thinking(msg["text"])
-        elif msg["type"] == "agent_message":
-            formatter.print_agent_message(msg["message"])
-        elif msg["type"] == "exec_command_begin":
-            formatter.print_tool_use(" ".join(msg["command"]), {})
-        elif msg["type"] == "exec_command_end":
-            if msg["exit_code"] == 0:
-                formatter.print_tool_result(msg["stdout"], False)
-            else:
-                formatter.print_tool_result(msg["stderr"], True)
-        elif msg["type"] == "mcp_tool_call_begin":
-            formatter.print_tool_use(
-                msg["invocation"]["server"] + "." + msg["invocation"]["tool"],
-                msg["invocation"]["arguments"],
-            )
-        elif msg["type"] == "mcp_tool_call_end":
-            formatter.print_tool_result(
-                msg["result"]["Ok"]["content"],
-                msg["result"]["Ok"]["isError"],
-            )
-        elif msg["type"] == "patch_apply_begin":
-            formatter.print_tool_use("patch_apply", msg["changes"])
-        elif msg["type"] == "patch_apply_end":
-            if msg["success"]:
-                formatter.print_tool_result(msg["stdout"], False)
-            else:
-                formatter.print_tool_result(msg["stderr"], True)
-        elif msg["type"] == "error":
-            # TODO: use different call?
-            formatter.print_tool_result(msg["message"], True)
-        elif msg["type"] == "exec_command_output_delta":
-            # doesn't seem very useful
-            pass
-        elif msg["type"] == "token_count":
-            # ignore
-            pass
-        elif msg["type"] == "agent_reasoning_section_break":
-            # ignore
-            pass
-        elif msg["type"] == "task_started":
-            # doesn't seem very useful
-            pass
-        elif msg["type"] == "turn_diff":
-            # ignore
-            pass
-        else:
-            logger.error(f"Unexpected Codex message type: {msg['type']}")
 
     async def query(self, prompt: str, model: str, max_cost: float | None, formatter: VerboseFormatter) -> AsyncIterator[CodexResponse]:
         if self.models_pricing is not None and model in self.models_pricing:
@@ -268,12 +233,12 @@ class CodexSession:
         cost = 0.0
 
         async for msg in self._receive_messages(proc):
-            self._process_experiment_message(msg, formatter)
+            self._process_message(msg, formatter)
 
-            if False and msg["msg"]["type"] == "token_count" and msg["msg"]["info"] is not None:
+            if msg["type"] == "turn.completed":
                 cost = _compute_cost(
-                    msg["msg"]["info"]["total_token_usage"],
-                    model_pricing
+                    msg["usage"],
+                    model_pricing,
                 )
                 yield CodexResponse(cost=cost, status="running")
 
@@ -293,12 +258,12 @@ class CodexSession:
             cost = 0.0
 
             async for msg in self._receive_messages(proc):
-                self._process_experiment_message(msg, formatter)
+                self._process_message(msg, formatter)
 
-                if False and msg["msg"]["type"] == "token_count" and msg["msg"]["info"] is not None:
+                if msg["type"] == "turn.completed":
                     cost = _compute_cost(
-                        msg["msg"]["info"]["total_token_usage"],
-                        model_pricing
+                        msg["usage"],
+                        model_pricing,
                     )
                     yield CodexResponse(cost=main_cost + cost, status="terminating_on_max_cost")
 

@@ -126,7 +126,16 @@ class ClaudeSession:
                     formatter.print_thinking(content.thinking)
                 elif isinstance(content, ToolUseBlock):
                     if content.name == "TodoWrite":
-                        formatter.print_todo(content.input.get("todos", []))
+                        formatter.print_todo([
+                            {
+                                "status": i["status"],
+                                "text": (
+                                    i.get("activeForm", i["content"])
+                                    if i["status"] == "in_progress" else i["content"]
+                                ),
+                            }
+                            for i in content.input.get("todos", [])
+                        ])
                     else:
                         formatter.print_tool_use(content.name, content.input)
                 elif isinstance(content, ToolResultBlock):
