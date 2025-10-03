@@ -57,7 +57,30 @@ def require_initialized(func):
     return wrapper
 
 
-@dataclass()
+@dataclass
+class DynamicWorkflowStep:
+    # immutable
+    name: str
+    handler: Callable[[DynamicWorkflowStep], None]
+    requires: list[WorkflowStep | DynamicWorkflowStep]
+    condition: Callable[[DynamicWorkflowStep], bool] | None
+
+    # mutable
+    status: Literal["pending", "running", "completed", "failed", "skipped"]
+    start_time: datetime | None = None
+    end_time: datetime | None = None
+    error: Exception | None = None
+
+    def __hash__(self) -> int:
+        return hash(self.name)
+
+    def __eq__(self, other) -> bool:
+        if not isinstance(other, DynamicWorkflowStep):
+            return False
+        return self.name == other.name
+
+
+@dataclass
 class WorkflowStep:
     # immutable
     name: str
@@ -65,7 +88,7 @@ class WorkflowStep:
     model: str
     session: ClaudeSession | CodexSession
     max_cost: float | None
-    requires: list[WorkflowStep]
+    requires: list[WorkflowStep | DynamicWorkflowStep]
     validator: Callable[[WorkflowStep], list[str]] | None
     validation_retry_model: str | None
     max_validation_retries: int
@@ -99,13 +122,12 @@ class WorkflowStep:
         return template.render(**context, **self.additional_context)
 
     def __hash__(self) -> int:
-        # Hash based on immutable fields only
-        return hash((self.name, self.prompt))
+        return hash(self.name)
 
     def __eq__(self, other) -> bool:
         if not isinstance(other, WorkflowStep):
             return False
-        return self.name == other.name and self.prompt == other.prompt
+        return self.name == other.name
 
 
 class AIWorkflow(ABC):
@@ -114,7 +136,7 @@ class AIWorkflow(ABC):
     execution_dir: Path
 
     start_time: datetime
-    steps: list[WorkflowStep]
+    steps: list[WorkflowStep | DynamicWorkflowStep]
     context: dict[str, Any]
 
     _init_called: bool
@@ -189,7 +211,7 @@ class AIWorkflow(ABC):
 
     @property
     def cumulative_cost(self) -> float:
-        return sum(step.cost for step in self.steps)
+        return sum(step.cost for step in self.steps if isinstance(step, WorkflowStep))
 
     @require_initialized
     def add_step(
@@ -198,7 +220,7 @@ class AIWorkflow(ABC):
         prompt: str,
         model: str,
         *,
-        requires: list[WorkflowStep] | None = None,
+        requires: list[WorkflowStep | DynamicWorkflowStep] | None = None,
         max_cost: float | None = None,
         validator: Callable[[WorkflowStep], list[str]] | None = None,
         validation_retry_model: str | None = None,
@@ -213,6 +235,8 @@ class AIWorkflow(ABC):
     ) -> WorkflowStep:
         """
         Validation retry always uses the same session.
+
+        IMPORTANT: Requiring a dynamic step doesn't wait for steps possibly created by that dynamic step.
         """
         if any(s.name == name for s in self.steps):
             raise ValueError(f"Step with name '{name}' already exists")
@@ -250,14 +274,38 @@ class AIWorkflow(ABC):
 
         return step
 
-    def _find_topological_order(self) -> list[WorkflowStep]:
+    def add_dynamic_step(
+        self,
+        name: str,
+        handler: Callable[[DynamicWorkflowStep], None],
+        *,
+        requires: list[WorkflowStep | DynamicWorkflowStep] | None = None,
+        condition: Callable[[DynamicWorkflowStep], bool] | None = None,
+    ) -> DynamicWorkflowStep:
+        """
+        IMPORTANT: Requiring a dynamic step doesn't wait for steps possibly created by that dynamic step.
+        """
+        if any(s.name == name for s in self.steps):
+            raise ValueError(f"Step with name '{name}' already exists")
+
+        step = DynamicWorkflowStep(
+            name=name,
+            status="pending",
+            handler=handler,
+            requires=requires or [],
+            condition=condition,
+        )
+        self.steps.append(step)
+        return step
+
+    def _find_topological_order(self) -> list[WorkflowStep | DynamicWorkflowStep]:
         """Find topological ordering of steps using Kahn's algorithm."""
         # Build in-degree map
         in_degree = {step: len(step.requires) for step in self.steps}
 
         # Find steps with no dependencies
         queue = [step for step in self.steps if in_degree[step] == 0]
-        result = []
+        result: list[WorkflowStep | DynamicWorkflowStep] = []
 
         while queue:
             current = queue.pop(0)
@@ -352,7 +400,9 @@ class AIWorkflow(ABC):
             with ctx as live:
                 while any(step.status in ["pending", "running"] for step in self.steps):
                     # Start all ready steps that can run
-                    for step in self.steps:
+                    dynamic_executed = False
+
+                    for step in list(self.steps):
                         if max_parallel_steps is not None and len(running) >= max_parallel_steps:
                             break
 
@@ -360,9 +410,13 @@ class AIWorkflow(ABC):
                             step.status == "pending" and
                             all(r.status in ["completed", "skipped"] for r in step.requires)
                         ):
-                            same_session_steps = [s for s in running.values() if s.session == step.session]
-                            if same_session_steps:
-                                raise RuntimeError(f"Step {step.name} shares the same session with steps: {', '.join(s.name for s in same_session_steps)}; and so cannot run in parallel")
+                            if isinstance(step, WorkflowStep):
+                                same_session_steps = [
+                                    s for s in running.values()
+                                    if isinstance(s, WorkflowStep) and s.session == step.session
+                                ]
+                                if same_session_steps:
+                                    raise RuntimeError(f"Step {step.name} shares the same session with steps: {', '.join(s.name for s in same_session_steps)}; and so cannot run in parallel")
 
                             skipped_requires = [r for r in step.requires if r.status == "skipped"]
                             if skipped_requires:
@@ -373,13 +427,26 @@ class AIWorkflow(ABC):
                                 step.start_time = datetime.now()
                                 step.end_time = step.start_time
                             else:
-                                task = asyncio.create_task(self._execute_step(step))
                                 step.status = "running"
                                 step.start_time = datetime.now()
-                                running[task] = step
+
+                                if isinstance(step, DynamicWorkflowStep):
+                                    try:
+                                        step.handler(step)
+                                        step.status = "completed"
+                                        step.end_time = datetime.now()
+                                        dynamic_executed = True
+                                        continue
+                                    except Exception as e:
+                                        step.status = "failed"
+                                        step.end_time = datetime.now()
+                                        raise e
+                                else:
+                                    task = asyncio.create_task(self._execute_step(step))
+                                    running[task] = step
 
                     # Wait for at least one to complete
-                    if running:
+                    if running and not dynamic_executed:
                         done, _ = await asyncio.wait(running.keys(), return_when=asyncio.FIRST_COMPLETED)
                         for task in done:
                             step = running.pop(task)
@@ -440,13 +507,18 @@ class AIWorkflow(ABC):
             else:
                 duration = "-"
 
-            # Format cost
-            cost = f"${step.cost:.4f}" if step.cost > 0 else "-"
+            if isinstance(step, DynamicWorkflowStep):
+                cost = "-"
+                model = "-"
+            else:
+                # Format cost
+                cost = f"${step.cost:.4f}" if step.cost > 0 else "-"
+                model = step.model
 
-            table.add_row(step_name, step.model, duration, cost, style=row_style)
+            table.add_row(step_name, model, duration, cost, style=row_style)
 
         # Add total row
-        total_cost = sum(step.cost for step in self.steps)
+        total_cost = sum(step.cost for step in self.steps if isinstance(step, WorkflowStep))
 
         table.add_section()
         table.add_row(
