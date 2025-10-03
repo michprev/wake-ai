@@ -1,7 +1,7 @@
 from pathlib import Path
 from typing import AsyncIterator, NamedTuple, Literal
 
-from claude_agent_sdk import AssistantMessage, ClaudeAgentOptions, Message, ResultMessage, SystemMessage, TextBlock, ThinkingBlock, ToolResultBlock, ToolUseBlock, UserMessage, query
+from claude_agent_sdk import AgentDefinition, AssistantMessage, ClaudeAgentOptions, McpServerConfig, Message, ResultMessage, SystemMessage, TextBlock, ThinkingBlock, ToolResultBlock, ToolUseBlock, UserMessage, query
 from claude_agent_sdk.types import SystemPromptPreset
 
 from .verbose_formatter import VerboseFormatter
@@ -58,6 +58,10 @@ class ClaudeSession:
     session_id: str | None
     allowed_tools: list[str]
     disallowed_tools: list[str]
+    mcp_servers: dict[str, McpServerConfig]
+    agents: dict[str, AgentDefinition]
+    system_prompt: str | SystemPromptPreset | None
+    fork_session_id: str | None
 
     def __init__(
         self,
@@ -67,7 +71,14 @@ class ClaudeSession:
         session_id: str | None = None,
         allowed_tools: list[str] | None = None,
         disallowed_tools: list[str] | None = None,
+        mcp_servers: dict[str, McpServerConfig] | None = None,
+        agents: dict[str, AgentDefinition] | None = None,
+        system_prompt: str | SystemPromptPreset | None = None,
+        fork_session_id: str | None = None,
     ):
+        if session_id is not None and fork_session_id is not None:
+            raise ValueError("session_id and fork_session_id cannot be used together")
+
         self.execution_dir = execution_dir
         self.working_dir = working_dir
         self.session_id = session_id
@@ -80,6 +91,17 @@ class ClaudeSession:
             self.disallowed_tools = []
         else:
             self.disallowed_tools = disallowed_tools
+
+        if mcp_servers is None:
+            mcp_servers = {}
+        self.mcp_servers = mcp_servers
+
+        if agents is None:
+            agents = {}
+        self.agents = agents
+
+        self.system_prompt = system_prompt
+        self.fork_session_id = fork_session_id
 
     def _process_message(self, message: Message, formatter: VerboseFormatter) -> None:
         if isinstance(message, UserMessage):
@@ -139,14 +161,17 @@ class ClaudeSession:
 
     async def query(self, prompt: str, model: str, max_cost: float | None, formatter: VerboseFormatter) -> AsyncIterator[ClaudeResponse]:
         options = ClaudeAgentOptions(
-            system_prompt=SystemPromptPreset(type="preset", preset="claude_code"),
+            system_prompt=self.system_prompt,
             allowed_tools=self.allowed_tools,
             disallowed_tools=self.disallowed_tools,
-            resume=self.session_id,
+            resume=self.session_id or self.fork_session_id,
             model=model,
             cwd=str(self.execution_dir),  # Set working directory for command execution
             permission_mode="default",
             max_turns=TURN_STEP,
+            mcp_servers=self.mcp_servers,
+            agents=self.agents,
+            fork_session=self.fork_session_id is not None,
         )
 
         total_cost = 0.0
@@ -165,9 +190,9 @@ class ClaudeSession:
         total_cost += result.total_cost_usd or 0.0
 
         assert self.session_id is not None
-        if options.resume is None:
-            # from now on we must keep using the same session id
-            options.resume = self.session_id
+        # from now on we must keep using the same session id
+        options.resume = self.session_id
+        options.fork_session = False
 
         while result.subtype == "error_max_turns" and (max_cost is None or total_cost < max_cost):
             yield ClaudeResponse(cost=total_cost, status="running")
