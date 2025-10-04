@@ -202,6 +202,14 @@ class CodexSession:
             elif msg["item"]["type"] == "mcp_tool_call":
                 # no new info, pass for now
                 pass  # TODO!!
+            elif msg["item"]["type"] == "todo_list":
+                formatter.print_todo([
+                    {
+                        "status": "pending" if not i["completed"] else "completed",
+                        "text": i["text"],
+                    }
+                    for i in msg["item"]["items"]
+                ])
             else:
                 logger.warning(f"Unexpected Codex item.completed message: {msg}")
         elif msg["type"] == "thread.started":
