@@ -21,6 +21,7 @@ COLORS = {
     "user": "bold white",
     "agent": "white",
     "thinking": "dim white",
+    "error": "bold red",
     "unknown": "dim red",
 }
 # TODO customizable style
@@ -44,6 +45,15 @@ class VerboseFormatter:
         self.verbosity = verbosity
         self.splitter = Rule(title=step_name, style="dim white")
         self.file_splitter = "─" * 100 + "\n"
+
+    def print_error(self, message: str) -> None:
+        if self.log_file is not None:
+            with open(self.log_file, "a") as f:
+                f.write(f"Error: {message}\n")
+                f.write(self.file_splitter)
+
+        self.console.print(self.splitter)
+        self.console.print("Error: " + message, style=COLORS["error"], markup=False)
 
     def print_user_message(self, message: str) -> None:
         if self.log_file is not None:

@@ -149,13 +149,14 @@ class CodexSession:
 
         if proc.returncode != 0:
             err = await proc.stderr.read()
+            stdout = await proc.stdout.read()
             raise RuntimeError(
-                f"Process failed with exit code: {proc.returncode}\n{err.decode('utf-8')}"
+                f"Process failed with exit code: {proc.returncode}\nStderr:\n{err.decode('utf-8')}\nStdout:\n{stdout.decode('utf-8')}"
             )
 
     def _process_message(self, msg: dict[str, Any], formatter: VerboseFormatter) -> None:
         if msg["type"] == "error":
-            formatter.print_tool_result(msg["message"], True)
+            formatter.print_error(msg["message"])
         elif msg["type"] == "item.started":
             if msg["item"]["type"] == "command_execution":
                 formatter.print_tool_use(msg["item"]["command"], {})

@@ -181,6 +181,7 @@ class ClaudeSession:
             mcp_servers=self.mcp_servers,
             agents=self.agents,
             fork_session=self.fork_session_id is not None,
+            stderr=formatter.print_error,
         )
 
         total_cost = 0.0
