@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 import json
 from datetime import datetime
@@ -279,3 +281,15 @@ class CodexSession:
                     yield CodexResponse(cost=main_cost + cost, status="terminating_on_max_cost")
 
         yield CodexResponse(cost=main_cost + cost, status="succeeded")
+
+    def clone(self) -> CodexSession:
+        """
+        Clone the session configuration, but start a new session.
+        """
+        return CodexSession(
+            execution_dir=self.execution_dir,
+            console=self.console,
+            session_id=None,
+            reasoning_effort=self.reasoning_effort,
+            models_pricing=self.models_pricing,
+        )

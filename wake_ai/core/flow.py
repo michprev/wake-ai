@@ -87,6 +87,7 @@ class WorkflowStep:
     prompt: str
     model: str
     session: ClaudeSession | CodexSession
+    retries: int
     max_cost: float | None
     requires: list[WorkflowStep | DynamicWorkflowStep]
     validator: Callable[[WorkflowStep], list[str]] | None
@@ -101,10 +102,10 @@ class WorkflowStep:
 
     # mutable
     status: Literal["pending", "running", "completed", "failed", "skipped"]
+    attempt: int = 0  # counterpart to retries
     cost: float = 0.0
     start_time: datetime | None = None
     end_time: datetime | None = None
-    error: Exception | None = None
 
     def format_prompt(self, context: dict[str, Any]) -> str:
         env = jinja2.Environment(undefined=jinja2.StrictUndefined)
@@ -224,6 +225,7 @@ class AIWorkflow(ABC):
         *,
         requires: list[WorkflowStep | DynamicWorkflowStep] | None = None,
         max_cost: float | None = None,
+        retries: int = 0,
         validator: Callable[[WorkflowStep], list[str]] | None = None,
         validation_retry_model: str | None = None,
         max_validation_retries: int = 3,
@@ -248,6 +250,9 @@ class AIWorkflow(ABC):
                 session = CodexSession(self.execution_dir, self.console)
             else:
                 session = ClaudeSession(self.execution_dir, self.working_dir)
+        else:
+            if retries > 0 and session.session_id is not None:
+                raise ValueError("Non-zero retries are not possible when continuing a session")
 
         step = WorkflowStep(
             name=name,
@@ -255,6 +260,7 @@ class AIWorkflow(ABC):
             prompt=prompt,
             model=model,
             session=session,
+            retries=retries,
             max_cost=max_cost,
             requires=requires or [],
             validator=validator,
@@ -444,6 +450,7 @@ class AIWorkflow(ABC):
                                         step.end_time = datetime.now()
                                         raise e
                                 else:
+                                    step.attempt += 1
                                     task = asyncio.create_task(self._execute_step(step))
                                     running[task] = step
 
@@ -452,10 +459,18 @@ class AIWorkflow(ABC):
                         done, _ = await asyncio.wait(running.keys(), return_when=asyncio.FIRST_COMPLETED)
                         for task in done:
                             step = running.pop(task)
-                            step.status = "completed" if task.exception() is None else "failed"
-                            step.end_time = datetime.now()
-                            if task.exception():
-                                raise task.exception()
+                            if task.exception() is None:
+                                step.status = "completed"
+                                step.end_time = datetime.now()
+                            else:
+                                if step.attempt <= step.retries:
+                                    step.status = "pending"
+                                    step.start_time = None
+                                    step.session = step.session.clone()
+                                else:
+                                    step.status = "failed"
+                                    step.end_time = datetime.now()
+                                    raise task.exception()
 
             return self.collect_result()
         finally:
@@ -474,6 +489,7 @@ class AIWorkflow(ABC):
             width=80,
         )
         table.add_column("Step", no_wrap=True, width=40)
+        table.add_column("Attempt", no_wrap=True, width=10)
         table.add_column("Model", no_wrap=True, width=25)
         table.add_column("Time", justify="right", width=15)
         table.add_column("Cost", justify="right", width=12)
@@ -512,12 +528,17 @@ class AIWorkflow(ABC):
             if isinstance(step, DynamicWorkflowStep):
                 cost = "-"
                 model = "-"
+                attempt = "-"
             else:
                 # Format cost
                 cost = f"${step.cost:.4f}" if step.cost > 0 else "-"
                 model = step.model
+                if step.attempt == 0:
+                    attempt = "-"
+                else:
+                    attempt = f"{step.attempt}/{step.retries + 1}"
 
-            table.add_row(step_name, model, duration, cost, style=row_style)
+            table.add_row(step_name, attempt, model, duration, cost, style=row_style)
 
         # Add total row
         total_cost = sum(step.cost for step in self.steps if isinstance(step, WorkflowStep))
@@ -525,6 +546,7 @@ class AIWorkflow(ABC):
         table.add_section()
         table.add_row(
             "Total",
+            "",
             "",
             f"{_format_duration((datetime.now() - self.start_time).total_seconds())}",
             f"${total_cost:.4f}",
