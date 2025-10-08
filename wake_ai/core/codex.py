@@ -222,6 +222,8 @@ class CodexSession:
             pass
         elif msg["type"] == "turn.completed":
             pass
+        elif msg["type"] == "turn.failed":
+            formatter.print_error(msg["error"]["message"])
         else:
             logger.warning(f"Unexpected Codex message: {msg}")
 
