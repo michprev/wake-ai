@@ -134,6 +134,8 @@ class AIWorkflow(ABC):
     console: Console
     working_dir: Path
     execution_dir: Path
+    cleanup_working_dir: bool
+    show_progress: bool
 
     start_time: datetime
     steps: list[WorkflowStep | DynamicWorkflowStep]
