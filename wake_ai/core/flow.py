@@ -17,6 +17,7 @@ from rich.console import Console
 from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
+from rich.traceback import Traceback
 
 from .claude import ClaudeSession
 from .codex import CodexSession
@@ -459,18 +460,23 @@ class AIWorkflow(ABC):
                         done, _ = await asyncio.wait(running.keys(), return_when=asyncio.FIRST_COMPLETED)
                         for task in done:
                             step = running.pop(task)
-                            if task.exception() is None:
+                            exception = task.exception()
+                            if exception is None:
                                 step.status = "completed"
                                 step.end_time = datetime.now()
                             else:
                                 if step.attempt <= step.retries:
+                                    traceback = Traceback.from_exception(type(exception), exception, exception.__traceback__)
+                                    self.console.print(traceback)
+                                    self.console.print(f"Exception happened during step {step.name}, retrying...")
+
                                     step.status = "pending"
                                     step.start_time = None
                                     step.session = step.session.clone()
                                 else:
                                     step.status = "failed"
                                     step.end_time = datetime.now()
-                                    raise task.exception()
+                                    raise exception
 
             return self.collect_result()
         finally:
