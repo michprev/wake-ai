@@ -492,13 +492,13 @@ class AIWorkflow(ABC):
             header_style="bold cyan",
             box=None,
             padding=(0, 1),
-            width=80,
+            min_width=125,
         )
         table.add_column("Step", no_wrap=True, width=40)
-        table.add_column("Attempt", no_wrap=True, width=10)
+        table.add_column("Attempt", no_wrap=True, width=20)
         table.add_column("Model", no_wrap=True, width=25)
-        table.add_column("Time", justify="right", width=15)
-        table.add_column("Cost", justify="right", width=12)
+        table.add_column("Time", justify="right", width=20)
+        table.add_column("Cost", justify="right", width=20)
 
         # Add rows for each step
         for step in self.steps:
