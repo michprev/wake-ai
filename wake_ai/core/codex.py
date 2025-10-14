@@ -45,7 +45,6 @@ class CodexResponse(NamedTuple):
 
 class CodexSession:
     execution_dir: Path
-    console: Console
     session_id: str | None
     reasoning_effort: str
     models_pricing: dict[str, CodexTokenPricing] | None
@@ -53,32 +52,15 @@ class CodexSession:
     def __init__(
         self,
         execution_dir: Path,
-        console: Console,
         *,
         session_id: str | None = None,
         reasoning_effort: str = "high",
         models_pricing: dict[str, CodexTokenPricing] | None = None,
     ):
         self.execution_dir = execution_dir
-        self.console = console
         self.session_id = session_id
         self.reasoning_effort = reasoning_effort
         self.models_pricing = models_pricing
-
-    def _load_session_id(self) -> None:
-        now = datetime.now()
-
-        sessions_dir = (
-            Path.home()
-            / ".codex"
-            / "sessions"
-            / now.strftime("%Y")
-            / now.strftime("%m")
-            / now.strftime("%d")
-        )
-        recent_file = max(sessions_dir.iterdir(), key=lambda x: x.stat().st_mtime)
-        parts = recent_file.stem.split("-")
-        self.session_id = "-".join(parts[-5:])
 
     async def _setup_process(self, prompt: str, model: str) -> asyncio.subprocess.Process:
         args = ["codex", "exec", "--json"]
@@ -118,13 +100,6 @@ class CodexSession:
         proc.stdin.write(prompt.encode("utf-8"))
         proc.stdin.write_eof()
         proc.stdin.close()
-
-        # funny thing - Codex doesn't print the session ID to stdout
-        # workaround: look into ~/.codex/sessions and figure out from there
-        # https://github.com/openai/codex/issues/3817
-        #if self.session_id is None:
-            #await asyncio.sleep(1)
-            #self._load_session_id()
 
         return proc
 
@@ -288,7 +263,6 @@ class CodexSession:
         """
         return CodexSession(
             execution_dir=self.execution_dir,
-            console=self.console,
             session_id=None,
             reasoning_effort=self.reasoning_effort,
             models_pricing=self.models_pricing,

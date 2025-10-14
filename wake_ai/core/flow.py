@@ -248,7 +248,7 @@ class AIWorkflow(ABC):
 
         if session is None:
             if model.lower() in GPT_PRICING:
-                session = CodexSession(self.execution_dir, self.console)
+                session = CodexSession(self.execution_dir)
             else:
                 session = ClaudeSession(self.execution_dir, self.working_dir)
         else:
