@@ -3,12 +3,12 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 import asyncio
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from functools import wraps
 from pathlib import Path
 import shutil
-from typing import Any, Literal, Callable
+from typing import Any, Literal, Callable, NamedTuple
 
 import jinja2
 import jinja2.meta
@@ -81,6 +81,13 @@ class DynamicWorkflowStep:
         return self.name == other.name
 
 
+class FailedWorkflowStep(NamedTuple):
+    cost: float
+    start_time: datetime
+    end_time: datetime
+    error: BaseException
+
+
 @dataclass
 class WorkflowStep:
     # immutable
@@ -104,6 +111,7 @@ class WorkflowStep:
     # mutable
     status: Literal["pending", "running", "completed", "failed", "skipped"]
     attempt: int = 0  # counterpart to retries
+    failed_attempts: list[FailedWorkflowStep] = field(default_factory=list)
     cost: float = 0.0
     start_time: datetime | None = None
     end_time: datetime | None = None
@@ -215,7 +223,7 @@ class AIWorkflow(ABC):
 
     @property
     def cumulative_cost(self) -> float:
-        return sum(step.cost for step in self.steps if isinstance(step, WorkflowStep))
+        return sum(step.cost + sum(f.cost for f in step.failed_attempts) for step in self.steps if isinstance(step, WorkflowStep))
 
     @require_initialized
     def add_step(
@@ -470,6 +478,15 @@ class AIWorkflow(ABC):
                                     self.console.print(traceback)
                                     self.console.print(f"Exception happened during step {step.name}, retrying...")
 
+                                    assert step.start_time is not None
+                                    step.failed_attempts.append(FailedWorkflowStep(
+                                        cost=step.cost,
+                                        start_time=step.start_time,
+                                        end_time=datetime.now(),
+                                        error=exception,
+                                    ))
+
+                                    step.cost = 0.0
                                     step.status = "pending"
                                     step.start_time = None
                                     step.session = step.session.clone()
@@ -544,10 +561,24 @@ class AIWorkflow(ABC):
                 else:
                     attempt = f"{step.attempt}/{step.retries + 1}"
 
+                # print failed attempts first
+                for i, failed_attempt in enumerate(step.failed_attempts):
+                    table.add_row(
+                        f"✗ {step.name}",
+                        f"{i + 1}/{step.retries + 1}",
+                        model,
+                        _format_duration((failed_attempt.end_time - failed_attempt.start_time).total_seconds()),
+                        f"${failed_attempt.cost:.4f}",
+                        style="dim red",
+                    )
+
             table.add_row(step_name, attempt, model, duration, cost, style=row_style)
 
         # Add total row
-        total_cost = sum(step.cost for step in self.steps if isinstance(step, WorkflowStep))
+        total_cost = sum(
+            step.cost + sum(f.cost for f in step.failed_attempts)
+            for step in self.steps if isinstance(step, WorkflowStep)
+        )
 
         table.add_section()
         table.add_row(
