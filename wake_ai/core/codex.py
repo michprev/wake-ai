@@ -21,21 +21,39 @@ TERMINATION_PROMPT = (
 )
 
 
-class TotalTokenUsage(TypedDict):
+class SimpleTotalTokenUsage(TypedDict):
     input_tokens: int
     cached_input_tokens: int
     output_tokens: int
 
 
-def _compute_cost(usage: TotalTokenUsage, costs: CodexTokenPricing) -> float:
-    non_cached_input_tokens = (
-        usage["input_tokens"] - usage["cached_input_tokens"]
-    )
-    return (
-        non_cached_input_tokens * costs.input_mtoken_cost / 1e6
-        + usage["cached_input_tokens"] * costs.cached_input_mtoken_cost / 1e6
-        + usage["output_tokens"] * costs.output_mtoken_cost / 1e6
-    )
+class TieredTotalTokenUsage(TypedDict):
+    flex: SimpleTotalTokenUsage
+    standard: SimpleTotalTokenUsage
+    priority: SimpleTotalTokenUsage
+
+
+def _compute_cost(
+    usage: SimpleTotalTokenUsage | TieredTotalTokenUsage,
+    costs: dict[Literal["flex", "standard", "priority"], CodexTokenPricing],
+    tier: Literal["flex", "standard", "priority"] = "standard",
+) -> float:
+    if "input_tokens" not in usage:
+        cost = 0.0
+        for tier in ["flex", "standard", "priority"]:
+            if tier in usage:
+                cost += _compute_cost(usage[tier], costs, tier)
+        return cost
+    else:
+        non_cached_input_tokens = (
+            usage["input_tokens"] - usage["cached_input_tokens"]
+        )
+        cost = (
+            non_cached_input_tokens * costs[tier].input_mtoken_cost / 1e6
+            + usage["cached_input_tokens"] * costs[tier].cached_input_mtoken_cost / 1e6
+            + usage["output_tokens"] * costs[tier].output_mtoken_cost / 1e6
+        )
+        return cost
 
 
 class CodexResponse(NamedTuple):
@@ -47,7 +65,7 @@ class CodexSession:
     execution_dir: Path
     session_id: str | None
     reasoning_effort: str
-    models_pricing: dict[str, CodexTokenPricing] | None
+    models_pricing: dict[str, dict[Literal["flex", "standard", "priority"], CodexTokenPricing]] | None
     service_tier: Literal["flex", "standard", "priority"] | None
 
     def __init__(
@@ -56,7 +74,7 @@ class CodexSession:
         *,
         session_id: str | None = None,
         reasoning_effort: str = "high",
-        models_pricing: dict[str, CodexTokenPricing] | None = None,
+        models_pricing: dict[str, dict[Literal["flex", "standard", "priority"], CodexTokenPricing]] | None = None,
         service_tier: Literal["flex", "standard", "priority"] | None = None,
     ):
         self.execution_dir = execution_dir
@@ -274,4 +292,5 @@ class CodexSession:
             session_id=None,
             reasoning_effort=self.reasoning_effort,
             models_pricing=self.models_pricing,
+            service_tier=self.service_tier,
         )
