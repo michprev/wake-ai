@@ -411,6 +411,7 @@ class AIWorkflow(ABC):
                 auto_refresh=True,
                 console=self.console,
                 transient=True,
+                vertical_overflow="visible",
                 get_renderable=self._get_status_display,
             )
 
