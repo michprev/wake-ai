@@ -48,6 +48,7 @@ class CodexSession:
     session_id: str | None
     reasoning_effort: str
     models_pricing: dict[str, CodexTokenPricing] | None
+    service_tier: Literal["flex", "standard", "priority"] | None
 
     def __init__(
         self,
@@ -56,14 +57,21 @@ class CodexSession:
         session_id: str | None = None,
         reasoning_effort: str = "high",
         models_pricing: dict[str, CodexTokenPricing] | None = None,
+        service_tier: Literal["flex", "standard", "priority"] | None = None,
     ):
         self.execution_dir = execution_dir
         self.session_id = session_id
         self.reasoning_effort = reasoning_effort
         self.models_pricing = models_pricing
+        self.service_tier = service_tier
 
     async def _setup_process(self, prompt: str, model: str) -> asyncio.subprocess.Process:
         args = ["codex", "exec", "--json"]
+
+        if self.service_tier is not None:
+            args.append("--service-tier")
+            args.append(self.service_tier)
+
         args.append("--model")
         args.append(model)
 
