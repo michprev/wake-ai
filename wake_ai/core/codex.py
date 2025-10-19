@@ -314,4 +314,5 @@ class CodexSession:
             reasoning_effort=self.reasoning_effort,
             models_pricing=self.models_pricing,
             service_tier=self.service_tier,
+            additional_options=self.additional_options,
         )
