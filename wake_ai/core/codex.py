@@ -111,7 +111,10 @@ class CodexSession:
 
         for key, value in self.additional_options.items():
             args.append("-c")
-            args.append(f"{key}='{value}'")
+            if isinstance(value, bool):
+                args.append(f"{key}={str(value).lower()}")
+            else:
+                args.append(f"{key}='{value}'")
 
         if self.session_id is not None:
             args.append("resume")
