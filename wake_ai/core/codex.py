@@ -67,6 +67,7 @@ class CodexSession:
     reasoning_effort: str
     models_pricing: dict[str, dict[Literal["flex", "standard", "priority"], CodexTokenPricing]] | None
     service_tier: Literal["flex", "standard", "priority"] | None
+    codex_executable: str
     additional_options: dict[str, Any]
 
     def __init__(
@@ -77,6 +78,7 @@ class CodexSession:
         reasoning_effort: str = "high",
         models_pricing: dict[str, dict[Literal["flex", "standard", "priority"], CodexTokenPricing]] | None = None,
         service_tier: Literal["flex", "standard", "priority"] | None = None,
+        codex_executable: str = "codex",
         additional_options: dict[str, Any] | None = None,
     ):
         self.execution_dir = execution_dir
@@ -84,10 +86,11 @@ class CodexSession:
         self.reasoning_effort = reasoning_effort
         self.models_pricing = models_pricing
         self.service_tier = service_tier
+        self.codex_executable = codex_executable
         self.additional_options = additional_options or {}
 
     async def _setup_process(self, prompt: str, model: str) -> asyncio.subprocess.Process:
-        args = ["codex", "exec", "--json"]
+        args = [self.codex_executable, "exec", "--json"]
 
         if self.service_tier is not None:
             args.append("--service-tier")
@@ -314,5 +317,6 @@ class CodexSession:
             reasoning_effort=self.reasoning_effort,
             models_pricing=self.models_pricing,
             service_tier=self.service_tier,
+            codex_executable=self.codex_executable,
             additional_options=self.additional_options,
         )
