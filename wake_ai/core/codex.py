@@ -176,7 +176,7 @@ class CodexSession:
             elif msg["item"]["type"] == "mcp_tool_call":
                 formatter.print_tool_use(
                     msg["item"]["server"] + "." + msg["item"]["tool"],
-                    {},  # TODO!!
+                    msg["item"].get("args", {}),
                 )
             elif msg["item"]["type"] == "todo_list":
                 formatter.print_todo([
@@ -214,8 +214,19 @@ class CodexSession:
                 message = "Changed files:\n" + "\n".join(ch["path"] + " " + ch["kind"] for ch in changes)
                 formatter.print_system_message(message)
             elif msg["item"]["type"] == "mcp_tool_call":
-                # no new info, pass for now
-                pass  # TODO!!
+                if msg["item"]["status"] == "completed":
+                    if "result" in msg["item"]:
+                        formatter.print_tool_result(
+                            msg["item"]["result"]["content"],
+                            msg["item"]["result"]["isError"] or False
+                        )
+                elif msg["item"]["status"] == "failed":
+                    if "result" in msg["item"]:
+                        formatter.print_tool_result(msg["item"]["result"], True)
+                    else:
+                        formatter.print_tool_result("MCP tool call failed", True)
+                else:
+                    logger.warning(f"Unexpected Codex item.completed message for MCP tool call: {msg['item']}")
             elif msg["item"]["type"] == "todo_list":
                 formatter.print_todo([
                     {
