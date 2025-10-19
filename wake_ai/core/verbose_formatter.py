@@ -46,8 +46,14 @@ class VerboseFormatter:
         self.splitter = Rule(title=step_name, style="dim white")
         self.file_splitter = "─" * 100 + "\n"
 
-        if log_file is not None:
-            log_file.unlink(missing_ok=True)
+        self.reset_log_file()
+
+    def reset_log_file(self) -> None:
+        if self.log_file is not None and self.log_file.exists():
+            i = 0
+            while self.log_file.with_suffix(f".{i}.log").exists():
+                i += 1
+            self.log_file.rename(self.log_file.with_suffix(f".{i}.log"))
 
     def print_error(self, message: str) -> None:
         if self.log_file is not None:

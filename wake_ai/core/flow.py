@@ -491,6 +491,7 @@ class AIWorkflow(ABC):
                                     step.status = "pending"
                                     step.start_time = None
                                     step.session = step.session.clone()
+                                    step.formatter.reset_log_file()
                                 else:
                                     step.status = "failed"
                                     step.end_time = datetime.now()
