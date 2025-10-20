@@ -17,7 +17,7 @@ COLORS = {
     "tool_result": "bright_cyan",
     "tool_result_json": "cyan",
     "tool_error": "bold red",
-    "system": "purple",
+    "system": "bright_blue",
     "user": "bold white",
     "agent": "white",
     "thinking": "dim white",

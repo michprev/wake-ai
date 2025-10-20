@@ -89,7 +89,7 @@ class CodexSession:
         self.codex_executable = codex_executable
         self.additional_options = additional_options or {}
 
-    async def _setup_process(self, prompt: str, model: str) -> asyncio.subprocess.Process:
+    async def _setup_process(self, prompt: str, model: str, formatter: VerboseFormatter) -> asyncio.subprocess.Process:
         args = [self.codex_executable, "exec", "--json"]
 
         if self.service_tier is not None:
@@ -125,7 +125,7 @@ class CodexSession:
             args.append("resume")
             args.append(self.session_id)
 
-        logger.info(f"Running {' '.join(args)}")
+        formatter.print_system_message(f"Running {' '.join(args)}")
 
         proc = await asyncio.create_subprocess_exec(
             args[0],
@@ -319,7 +319,7 @@ class CodexSession:
 
         # each launched process starts counting tokens from the beginning
         # (even if we continue an existing session)
-        proc = await self._setup_process(prompt, model)
+        proc = await self._setup_process(prompt, model, formatter)
 
         formatter.print_user_message(prompt)
         terminated = False
@@ -347,7 +347,7 @@ class CodexSession:
 
         if terminated:
             formatter.print_user_message(TERMINATION_PROMPT)
-            proc = await self._setup_process(TERMINATION_PROMPT, model)
+            proc = await self._setup_process(TERMINATION_PROMPT, model, formatter)
             cost = 0.0
 
             async for msg in self._receive_messages(proc):
