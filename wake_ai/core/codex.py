@@ -4,7 +4,7 @@ import asyncio
 import json
 from datetime import datetime
 from pathlib import Path
-from typing import AsyncIterator, TypedDict, Any, NamedTuple, Literal
+from typing import AsyncIterator, Generator, TypedDict, Any, NamedTuple, Literal
 
 from rich.console import Console
 from rich.rule import Rule
@@ -133,7 +133,7 @@ class CodexSession:
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            limit=100 * 1024 * 1024,  # 100MB
+            limit=128 * 1024 * 1024,  # 128MB
         )
 
         assert proc.stdin is not None
@@ -148,20 +148,73 @@ class CodexSession:
         assert proc.stdout is not None
         assert proc.stderr is not None
 
-        while True:
+        def get_chunk_size(buffer_size: int) -> int:
+            """Exponentially scale chunk size with buffer size for efficient reading of both small and huge messages."""
+            if buffer_size < 512 * 1024:
+                return 64 * 1024       # 64KB - normal messages
+            elif buffer_size < 10 * 1024 * 1024:
+                return 1024 * 1024     # 1MB - large messages
+            elif buffer_size < 100 * 1024 * 1024:
+                return 16 * 1024 * 1024  # 16MB - very large messages
+            else:
+                return 64 * 1024 * 1024  # 64MB - truly massive messages (e.g., 1GB)
+
+        def process_line(line: bytes) -> dict[str, Any] | None:
+            if not line.strip():
+                return None
+
             try:
-                line = await proc.stdout.readline()
-            except ValueError:
-                tmp = await proc.stdout.read(1024 * 1024)
-                logger.error(f"Failed to read from Codex stdout")
-                logger.error(f"artifact data:\n{tmp}")
+                return json.loads(line.decode("utf-8"))
+            except json.JSONDecodeError as e:
+                preview_size = 500
+                if len(line) <= preview_size * 2:
+                    preview = line
+                else:
+                    preview = line[:preview_size] + b" ... " + line[-preview_size:]
+
+                logger.error(f"Failed to parse JSON (line size: {len(line)} bytes): {e}")
+                logger.error(f"Line preview: {preview}")
+                return None
+
+        def extract_messages(buffer: bytearray) -> Generator[dict[str, Any], None, None]:
+            while True:
+                newline_pos = buffer.find(b"\n")
+                if newline_pos == -1:
+                    break
+
+                line = bytes(buffer[:newline_pos])
+                del buffer[:newline_pos + 1]  # remove line + newline
+                msg = process_line(line)
+                if msg is not None:
+                    yield msg
+
+        buffer = bytearray()
+
+        while True:
+            chunk_size = get_chunk_size(len(buffer))
+
+            try:
+                chunk = await proc.stdout.read(chunk_size)
+            except Exception as e:
+                logger.error(f"Failed to read from Codex stdout: {e}")
+                logger.error(f"Buffer size at failure: {len(buffer)} bytes")
                 raise
 
-            if not line:
+            if not chunk:  # EOF
                 break
 
-            msg = json.loads(line.decode("utf-8"))
+            buffer.extend(chunk)
+
+            for msg in extract_messages(buffer):
+                yield msg
+
+        # process remaining buffer
+        for msg in extract_messages(buffer):
             yield msg
+
+        buffer = buffer.strip()
+        if buffer:
+            logger.error(f"Unprocessed Codex buffer: {buffer}")
 
         await proc.wait()
 
