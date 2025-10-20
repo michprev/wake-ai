@@ -492,6 +492,9 @@ class AIWorkflow(ABC):
                                     step.start_time = None
                                     step.session = step.session.clone()
                                     step.formatter.reset_log_file()
+
+                                    # wait for 60 seconds to avoid overwhelming the server
+                                    await asyncio.sleep(60)
                                 else:
                                     step.status = "failed"
                                     step.end_time = datetime.now()
