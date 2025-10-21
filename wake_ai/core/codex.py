@@ -64,6 +64,7 @@ class CodexResponse(NamedTuple):
 class CodexSession:
     execution_dir: Path
     session_id: str | None
+    fork_session_id: str | None
     reasoning_effort: str
     models_pricing: dict[str, dict[Literal["flex", "standard", "priority"], CodexTokenPricing]] | None
     service_tier: Literal["flex", "standard", "priority"] | None
@@ -75,14 +76,19 @@ class CodexSession:
         execution_dir: Path,
         *,
         session_id: str | None = None,
+        fork_session_id: str | None = None,
         reasoning_effort: str = "high",
         models_pricing: dict[str, dict[Literal["flex", "standard", "priority"], CodexTokenPricing]] | None = None,
         service_tier: Literal["flex", "standard", "priority"] | None = None,
         codex_executable: str = "codex",
         additional_options: dict[str, Any] | None = None,
     ):
+        if session_id is not None and fork_session_id is not None:
+            raise ValueError("session_id and fork_session_id cannot be used together")
+
         self.execution_dir = execution_dir
         self.session_id = session_id
+        self.fork_session_id = fork_session_id
         self.reasoning_effort = reasoning_effort
         self.models_pricing = models_pricing
         self.service_tier = service_tier
@@ -124,6 +130,10 @@ class CodexSession:
         if self.session_id is not None:
             args.append("resume")
             args.append(self.session_id)
+        elif self.fork_session_id is not None:
+            args.append("resume")
+            args.append(self.fork_session_id)
+            args.append("--fork")
 
         formatter.print_system_message(f"Running {' '.join(args)}")
 
@@ -369,6 +379,7 @@ class CodexSession:
         return CodexSession(
             execution_dir=self.execution_dir,
             session_id=None,
+            fork_session_id=self.fork_session_id,
             reasoning_effort=self.reasoning_effort,
             models_pricing=self.models_pricing,
             service_tier=self.service_tier,
