@@ -6,6 +6,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime
 from functools import wraps
+from io import StringIO
 from pathlib import Path
 import shutil
 from typing import Any, Literal, Callable, NamedTuple
@@ -152,6 +153,7 @@ class AIWorkflow(ABC):
     context: dict[str, Any]
 
     _init_called: bool
+    _last_status_snapshot: tuple[Any, ...] | None
 
     def __init__(
         self,
@@ -191,6 +193,7 @@ class AIWorkflow(ABC):
 
         # Create working directory
         self.working_dir.mkdir(parents=True, exist_ok=True)
+        self.steps_log_file = self.working_dir / "steps.log"
 
         self.execution_dir = (
             Path(execution_dir).resolve() if execution_dir else Path.cwd()
@@ -220,6 +223,7 @@ class AIWorkflow(ABC):
         self.steps = []
         self.context = {}
         self._init_called = True
+        self._last_status_snapshot = None
 
     @property
     def cumulative_cost(self) -> float:
@@ -593,6 +597,26 @@ class AIWorkflow(ABC):
             f"${total_cost:.4f}",
             style="bold",
         )
+
+        # Write rendered status to log file only when status changes (not time)
+        current_snapshot = tuple(
+            (
+                step.name,
+                step.status,
+                step.attempt if isinstance(step, WorkflowStep) else None,
+                step.cost if isinstance(step, WorkflowStep) else None,
+                tuple(f.cost for f in step.failed_attempts) if isinstance(step, WorkflowStep) else None,
+            )
+            for step in self.steps
+        )
+
+        if current_snapshot != self._last_status_snapshot:
+            buffer = StringIO()
+            log_console = Console(file=buffer, force_terminal=False, width=84)
+            log_console.print(table)
+            with open(self.steps_log_file, "w") as f:
+                f.write(buffer.getvalue())
+            self._last_status_snapshot = current_snapshot
 
         # Return panel with table and status
         return Panel(table, title="", border_style="blue", width=84)
