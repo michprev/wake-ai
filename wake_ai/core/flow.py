@@ -262,6 +262,9 @@ class AIWorkflow(ABC):
         if any(s.name == name for s in self.steps):
             raise ValueError(f"Step with name '{name}' already exists")
 
+        if ("\\" in name or "/" in name):
+            raise ValueError(f"Step contains invalid characters: '{name}'")
+
         if session is None:
             if model.lower() in GPT_PRICING:
                 session = CodexSession(self.execution_dir)
