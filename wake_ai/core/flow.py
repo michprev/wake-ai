@@ -93,7 +93,7 @@ class FailedWorkflowStep(NamedTuple):
 class WorkflowStep:
     # immutable
     name: str
-    prompt: str
+    prompt: str | Path
     model: str
     session: ClaudeSession | CodexSession
     retries: int
@@ -118,10 +118,14 @@ class WorkflowStep:
     end_time: datetime | None = None
 
     def format_prompt(self, context: dict[str, Any]) -> str:
-        env = jinja2.Environment(undefined=jinja2.StrictUndefined)
+        env = jinja2.Environment(
+            undefined=jinja2.StrictUndefined,
+            loader=jinja2.FileSystemLoader(str(self.prompt.parent)) if isinstance(self.prompt, Path) else None
+        )
+        prompt_text = self.prompt.read_text() if isinstance(self.prompt, Path) else self.prompt
 
         # Parse the template to find all variables
-        ast = env.parse(self.prompt)
+        ast = env.parse(prompt_text)
         prompt_context_keys = jinja2.meta.find_undeclared_variables(ast)
 
         # Warn if there are context keys that are not in the context
@@ -129,7 +133,7 @@ class WorkflowStep:
             if key not in context and key not in self.additional_context:
                 print(f"Context key '{key}' used in step '{self.name}' not provided")
 
-        template = env.from_string(self.prompt)
+        template = env.from_string(prompt_text)
         return template.render(**context, **self.additional_context)
 
     def __hash__(self) -> int:
@@ -233,7 +237,7 @@ class AIWorkflow(ABC):
     def add_step(
         self,
         name: str,
-        prompt: str,
+        prompt: str | Path,
         model: str,
         *,
         requires: list[WorkflowStep | DynamicWorkflowStep] | None = None,
