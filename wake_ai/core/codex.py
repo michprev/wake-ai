@@ -71,6 +71,8 @@ class CodexSession:
     codex_executable: str
     additional_options: dict[str, Any]
 
+    token_usage: TieredTotalTokenUsage
+
     def __init__(
         self,
         execution_dir: Path,
@@ -94,6 +96,23 @@ class CodexSession:
         self.service_tier = service_tier
         self.codex_executable = codex_executable
         self.additional_options = additional_options or {}
+
+        self.token_usage = TieredTotalTokenUsage(
+            flex=SimpleTotalTokenUsage(input_tokens=0, cached_input_tokens=0, output_tokens=0),
+            standard=SimpleTotalTokenUsage(input_tokens=0, cached_input_tokens=0, output_tokens=0),
+            priority=SimpleTotalTokenUsage(input_tokens=0, cached_input_tokens=0, output_tokens=0),
+        )
+
+    def _update_token_usage(self, usage: SimpleTotalTokenUsage | TieredTotalTokenUsage) -> None:
+        if "input_tokens" in usage:
+            self.token_usage["standard"]["input_tokens"] += usage["input_tokens"]
+            self.token_usage["standard"]["cached_input_tokens"] += usage["cached_input_tokens"]
+            self.token_usage["standard"]["output_tokens"] += usage["output_tokens"]
+        else:
+            for tier in ["flex", "standard", "priority"]:
+                self.token_usage[tier]["input_tokens"] += usage[tier]["input_tokens"]
+                self.token_usage[tier]["cached_input_tokens"] += usage[tier]["cached_input_tokens"]
+                self.token_usage[tier]["output_tokens"] += usage[tier]["output_tokens"]
 
     async def _setup_process(self, prompt: str, model: str, formatter: VerboseFormatter) -> asyncio.subprocess.Process:
         args = [self.codex_executable, "exec", "--json"]
@@ -339,6 +358,7 @@ class CodexSession:
             self._process_message(msg, formatter)
 
             if msg["type"] == "turn.completed":
+                self._update_token_usage(msg["usage"])
                 cost = _compute_cost(
                     msg["usage"],
                     model_pricing,
@@ -364,6 +384,7 @@ class CodexSession:
                 self._process_message(msg, formatter)
 
                 if msg["type"] == "turn.completed":
+                    self._update_token_usage(msg["usage"])
                     cost = _compute_cost(
                         msg["usage"],
                         model_pricing,
