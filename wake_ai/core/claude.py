@@ -63,7 +63,7 @@ class ClaudeSession:
     mcp_servers: dict[str, McpServerConfig]
     agents: dict[str, AgentDefinition]
     system_prompt: str | SystemPromptPreset | None
-    fork_session_id: str | None
+    fork_session: str | ClaudeSession | None
 
     def __init__(
         self,
@@ -76,10 +76,10 @@ class ClaudeSession:
         mcp_servers: dict[str, McpServerConfig] | None = None,
         agents: dict[str, AgentDefinition] | None = None,
         system_prompt: str | SystemPromptPreset | None = None,
-        fork_session_id: str | None = None,
+        fork_session: str | ClaudeSession | None = None,
     ):
-        if session_id is not None and fork_session_id is not None:
-            raise ValueError("session_id and fork_session_id cannot be used together")
+        if session_id is not None and fork_session is not None:
+            raise ValueError("session_id and fork_session cannot be used together")
 
         self.execution_dir = execution_dir
         self.working_dir = working_dir
@@ -103,7 +103,7 @@ class ClaudeSession:
         self.agents = agents
 
         self.system_prompt = system_prompt
-        self.fork_session_id = fork_session_id
+        self.fork_session = fork_session
 
     def _process_message(self, message: Message, formatter: VerboseFormatter) -> None:
         if isinstance(message, UserMessage):
@@ -171,18 +171,26 @@ class ClaudeSession:
             logger.warning(f"Unexpected Claude message type: {type(message)}")
 
     async def query(self, prompt: str, model: str, max_cost: float | None, formatter: VerboseFormatter) -> AsyncIterator[ClaudeResponse]:
+        if self.fork_session is not None:
+            if isinstance(self.fork_session, str):
+                fork_session_id = self.fork_session
+            else:
+                if self.fork_session.session_id is None:
+                    raise RuntimeError("Forking from ClaudeSession without assigned session id")
+                fork_session_id = self.fork_session.session_id
+
         options = ClaudeAgentOptions(
             system_prompt=self.system_prompt,
             allowed_tools=self.allowed_tools,
             disallowed_tools=self.disallowed_tools,
-            resume=self.session_id or self.fork_session_id,
+            resume=self.session_id or fork_session_id,
             model=model,
             cwd=str(self.execution_dir),  # Set working directory for command execution
             permission_mode="default",
             max_turns=TURN_STEP,
             mcp_servers=self.mcp_servers,
             agents=self.agents,
-            fork_session=self.fork_session_id is not None,
+            fork_session=fork_session_id is not None,
             stderr=formatter.print_error,
         )
 
@@ -261,5 +269,5 @@ class ClaudeSession:
             mcp_servers=dict(self.mcp_servers),
             agents=dict(self.agents),
             system_prompt=self.system_prompt,
-            fork_session_id=self.fork_session_id,
+            fork_session=self.fork_session,
         )
