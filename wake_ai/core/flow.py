@@ -500,7 +500,7 @@ class AIWorkflow(ABC):
                                     step.cost = 0.0
                                     step.status = "pending"
                                     step.start_time = None
-                                    step.session = step.session.clone()
+                                    step.session.reset()
                                     step.formatter.reset_log_file()
 
                                     # wait for 60 seconds to avoid overwhelming the server

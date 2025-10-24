@@ -256,18 +256,8 @@ class ClaudeSession:
             yield ClaudeResponse(cost=total_cost, status="errored")
             raise RuntimeError(f"Claude Code returned an unexpected subtype: {result.subtype}")
 
-    def clone(self) -> ClaudeSession:
+    def reset(self) -> None:
         """
-        Clone the session configuration, but start a new session.
+        Reset the session ID
         """
-        return ClaudeSession(
-            execution_dir=self.execution_dir,
-            working_dir=self.working_dir,
-            session_id=None,
-            allowed_tools=list(self.allowed_tools),
-            disallowed_tools=list(self.disallowed_tools),
-            mcp_servers=dict(self.mcp_servers),
-            agents=dict(self.agents),
-            system_prompt=self.system_prompt,
-            fork_session=self.fork_session,
-        )
+        self.session_id = None

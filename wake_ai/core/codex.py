@@ -400,17 +400,9 @@ class CodexSession:
 
         yield CodexResponse(cost=main_cost + cost, status="succeeded")
 
-    def clone(self) -> CodexSession:
+    def reset(self) -> None:
         """
-        Clone the session configuration, but start a new session.
+        Reset the session ID
         """
-        return CodexSession(
-            execution_dir=self.execution_dir,
-            session_id=None,
-            fork_session=self.fork_session,
-            reasoning_effort=self.reasoning_effort,
-            models_pricing=self.models_pricing,
-            service_tier=self.service_tier,
-            codex_executable=self.codex_executable,
-            additional_options=self.additional_options,
-        )
+        self.session_id = None
+        # keep token_usage
