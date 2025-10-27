@@ -141,7 +141,7 @@ class CodexSession:
             args.append("-c")
             if isinstance(value, bool):
                 args.append(f"{key}={str(value).lower()}")
-            elif isinstance(value, list):
+            elif isinstance(value, (list, int)):
                 args.append(f"{key}={value}")
             else:
                 args.append(f"{key}='{value}'")
