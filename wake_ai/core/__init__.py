@@ -2,4 +2,4 @@
 
 from .claude import ClaudeSession
 from .codex import CodexSession
-from .flow import AIWorkflow, WorkflowStep
+from .flow import AIWorkflow, WorkflowStep, DynamicWorkflowStep

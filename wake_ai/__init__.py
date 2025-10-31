@@ -6,6 +6,7 @@ from .cli import main as workflow
 from .core import (
     AIWorkflow,
     WorkflowStep,
+    DynamicWorkflowStep,
     ClaudeSession,
     CodexSession,
 )

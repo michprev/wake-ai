@@ -9,7 +9,7 @@ from functools import wraps
 from io import StringIO
 from pathlib import Path
 import shutil
-from typing import Any, Literal, Callable, NamedTuple
+from typing import Any, Awaitable, Literal, Callable, NamedTuple, Coroutine, TypeVar, Generic, cast
 
 import jinja2
 import jinja2.meta
@@ -59,19 +59,41 @@ def require_initialized(func):
     return wrapper
 
 
+T = TypeVar("T")
+
+
+class DynamicStepResult(Generic[T]):
+    def __init__(self, step: DynamicWorkflowStep[T]):
+        self._step = step
+
+    def __await__(self):  # type: ignore[override]
+        async def _wait() -> T:
+            await self._step.done_event.wait()
+            if self._step.status == "skipped":
+                raise RuntimeError(f"Step '{self._step.name}' was skipped")
+            if self._step.error is not None:
+                raise self._step.error
+            return cast(T, self._step._return_value)
+
+        return _wait().__await__()
+
+
 @dataclass
-class DynamicWorkflowStep:
+class DynamicWorkflowStep(Generic[T]):
     # immutable
     name: str
-    handler: Callable[[DynamicWorkflowStep], None]
-    requires: list[WorkflowStep | DynamicWorkflowStep]
-    condition: Callable[[DynamicWorkflowStep], bool] | None
+    handler: Callable[[DynamicWorkflowStep[T]], Coroutine[Any, Any, T]]
+    requires: list[WorkflowStep | DynamicWorkflowStep[Any]]
+    condition: Callable[[DynamicWorkflowStep[T]], bool] | None
+    done_event: asyncio.Event
+    result: Awaitable[T]
 
     # mutable
     status: Literal["pending", "running", "completed", "failed", "skipped"]
+    _return_value: T | None = None
     start_time: datetime | None = None
     end_time: datetime | None = None
-    error: Exception | None = None
+    error: BaseException | None = None
 
     def __hash__(self) -> int:
         return hash(self.name)
@@ -108,6 +130,7 @@ class WorkflowStep:
     condition: Callable[[WorkflowStep], bool] | None
     formatter: VerboseFormatter
     additional_context: dict[str, Any]
+    done_event: asyncio.Event
 
     # mutable
     status: Literal["pending", "running", "completed", "failed", "skipped"]
@@ -116,6 +139,7 @@ class WorkflowStep:
     cost: float = 0.0
     start_time: datetime | None = None
     end_time: datetime | None = None
+    error: BaseException | None = None
 
     def format_prompt(self, context: dict[str, Any]) -> str:
         env = jinja2.Environment(
@@ -153,7 +177,7 @@ class AIWorkflow(ABC):
     show_progress: bool
 
     start_time: datetime
-    steps: list[WorkflowStep | DynamicWorkflowStep]
+    steps: list[WorkflowStep | DynamicWorkflowStep[Any]]
     context: dict[str, Any]
 
     _init_called: bool
@@ -240,7 +264,7 @@ class AIWorkflow(ABC):
         prompt: str | Path,
         model: str,
         *,
-        requires: list[WorkflowStep | DynamicWorkflowStep] | None = None,
+        requires: list[WorkflowStep | DynamicWorkflowStep[Any]] | None = None,
         max_cost: float | None = None,
         retries: int = 0,
         validator: Callable[[WorkflowStep], list[str]] | None = None,
@@ -294,6 +318,7 @@ class AIWorkflow(ABC):
                 formatter or VerboseFormatter(self.console, name, self.working_dir / f"{name}.log", get_verbosity_level())
             ),
             additional_context=additional_context or {},
+            done_event=asyncio.Event(),
         )
         self.steps.append(step)
 
@@ -305,11 +330,11 @@ class AIWorkflow(ABC):
     def add_dynamic_step(
         self,
         name: str,
-        handler: Callable[[DynamicWorkflowStep], None],
+        handler: Callable[[DynamicWorkflowStep[T]], Coroutine[Any, Any, T]],
         *,
-        requires: list[WorkflowStep | DynamicWorkflowStep] | None = None,
-        condition: Callable[[DynamicWorkflowStep], bool] | None = None,
-    ) -> DynamicWorkflowStep:
+        requires: list[WorkflowStep | DynamicWorkflowStep[Any]] | None = None,
+        condition: Callable[[DynamicWorkflowStep[T]], bool] | None = None,
+    ) -> DynamicWorkflowStep[T]:
         """
         IMPORTANT: Requiring a dynamic step doesn't wait for steps possibly created by that dynamic step.
         """
@@ -322,18 +347,21 @@ class AIWorkflow(ABC):
             handler=handler,
             requires=requires or [],
             condition=condition,
+            done_event=asyncio.Event(),
+            result=None,  # temporary
         )
+        step.result = DynamicStepResult(step)
         self.steps.append(step)
         return step
 
-    def _find_topological_order(self) -> list[WorkflowStep | DynamicWorkflowStep]:
+    def _find_topological_order(self) -> list[WorkflowStep | DynamicWorkflowStep[Any]]:
         """Find topological ordering of steps using Kahn's algorithm."""
         # Build in-degree map
         in_degree = {step: len(step.requires) for step in self.steps}
 
         # Find steps with no dependencies
         queue = [step for step in self.steps if in_degree[step] == 0]
-        result: list[WorkflowStep | DynamicWorkflowStep] = []
+        result: list[WorkflowStep | DynamicWorkflowStep[Any]] = []
 
         while queue:
             current = queue.pop(0)
@@ -350,11 +378,11 @@ class AIWorkflow(ABC):
         if len(result) != len(self.steps):
             raise ValueError("Steps form a cycle")
 
-        # Reorder: non-pending steps first, then pending steps, maintaining relative order
-        non_pending = [step for step in result if step.status != "pending"]
         pending = [step for step in result if step.status == "pending"]
+        running = sorted((step for step in result if step.status == "running"), key=lambda x: x.start_time)
+        others = sorted((step for step in result if step.status not in ["pending", "running"]), key=lambda x: x.end_time)
 
-        return non_pending + pending
+        return others + running + pending
 
     # running in a separate asyncio task
     async def _execute_step(self, step: WorkflowStep) -> None:
@@ -412,7 +440,7 @@ class AIWorkflow(ABC):
         max_parallel_steps: int | None = None,
     ) -> AIResult:
         try:
-            running: dict[asyncio.Task, WorkflowStep] = {}
+            running: dict[asyncio.Task, WorkflowStep | DynamicWorkflowStep[Any]] = {}
 
             self.start_time = datetime.now()
 
@@ -428,10 +456,12 @@ class AIWorkflow(ABC):
             with ctx as live:
                 while any(step.status in ["pending", "running"] for step in self.steps):
                     # Start all ready steps that can run
-                    dynamic_executed = False
-
                     for step in list(self.steps):
-                        if max_parallel_steps is not None and len(running) >= max_parallel_steps:
+                        # only count WorkflowSteps
+                        if (
+                            max_parallel_steps is not None
+                            and len([s for s in running.values() if isinstance(s, WorkflowStep)]) >= max_parallel_steps
+                        ):
                             break
 
                         if (
@@ -454,61 +484,58 @@ class AIWorkflow(ABC):
                                 step.status = "skipped"
                                 step.start_time = datetime.now()
                                 step.end_time = step.start_time
+                                step.done_event.set()
                             else:
                                 step.status = "running"
                                 step.start_time = datetime.now()
 
-                                if isinstance(step, DynamicWorkflowStep):
-                                    try:
-                                        step.handler(step)
-                                        step.status = "completed"
-                                        step.end_time = datetime.now()
-                                        dynamic_executed = True
-                                        continue
-                                    except Exception as e:
-                                        step.status = "failed"
-                                        step.end_time = datetime.now()
-                                        raise e
-                                else:
+                                if isinstance(step, WorkflowStep):
                                     step.attempt += 1
                                     task = asyncio.create_task(self._execute_step(step))
-                                    running[task] = step
-
-                    # Wait for at least one to complete
-                    if running and not dynamic_executed:
-                        done, _ = await asyncio.wait(running.keys(), return_when=asyncio.FIRST_COMPLETED)
-                        for task in done:
-                            step = running.pop(task)
-                            exception = task.exception()
-                            if exception is None:
-                                step.status = "completed"
-                                step.end_time = datetime.now()
-                            else:
-                                if step.attempt <= step.retries:
-                                    traceback = Traceback.from_exception(type(exception), exception, exception.__traceback__)
-                                    self.console.print(traceback)
-                                    self.console.print(f"Exception happened during step {step.name}, retrying...")
-
-                                    assert step.start_time is not None
-                                    step.failed_attempts.append(FailedWorkflowStep(
-                                        cost=step.cost,
-                                        start_time=step.start_time,
-                                        end_time=datetime.now(),
-                                        error=exception,
-                                    ))
-
-                                    step.cost = 0.0
-                                    step.status = "pending"
-                                    step.start_time = None
-                                    step.session.reset()
-                                    step.formatter.reset_log_file()
-
-                                    # wait for 60 seconds to avoid overwhelming the server
-                                    await asyncio.sleep(60)
                                 else:
-                                    step.status = "failed"
-                                    step.end_time = datetime.now()
-                                    raise exception
+                                    dynamic_step = cast(DynamicWorkflowStep[Any], step)
+                                    task = asyncio.create_task(dynamic_step.handler(dynamic_step))
+                                running[task] = step
+
+                    # dynamic steps may produce new children steps at runtime and wait for them to complete
+                    done, _ = await asyncio.wait(running.keys(), timeout=1, return_when=asyncio.FIRST_COMPLETED)
+                    for task in done:
+                        step = running.pop(task)
+                        exception = task.exception()
+                        if exception is None:
+                            step.status = "completed"
+                            step.end_time = datetime.now()
+                            if isinstance(step, DynamicWorkflowStep):
+                                step._return_value = task.result()
+                            step.done_event.set()
+                        else:
+                            if isinstance(step, WorkflowStep) and step.attempt <= step.retries:
+                                traceback = Traceback.from_exception(type(exception), exception, exception.__traceback__)
+                                self.console.print(traceback)
+                                self.console.print(f"Exception happened during step {step.name}, retrying...")
+
+                                assert step.start_time is not None
+                                step.failed_attempts.append(FailedWorkflowStep(
+                                    cost=step.cost,
+                                    start_time=step.start_time,
+                                    end_time=datetime.now(),
+                                    error=exception,
+                                ))
+
+                                step.cost = 0.0
+                                step.status = "pending"
+                                step.start_time = None
+                                step.session.reset()
+                                step.formatter.reset_log_file()
+
+                                # wait for 60 seconds to avoid overwhelming the server
+                                await asyncio.sleep(60)
+                            else:
+                                step.status = "failed"
+                                step.end_time = datetime.now()
+                                step.error = exception
+                                step.done_event.set()
+                                raise exception
 
             return self.collect_result()
         finally:
@@ -534,6 +561,9 @@ class AIWorkflow(ABC):
 
         # Add rows for each step
         for step in self.steps:
+            if isinstance(step, DynamicWorkflowStep):
+                continue
+
             # Determine row style based on status
             if step.status == "pending":
                 row_style = "dim"
