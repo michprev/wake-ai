@@ -1,4 +1,5 @@
 import json
+from datetime import datetime
 from pathlib import Path
 from typing import Any, TypedDict, Literal
 
@@ -36,17 +37,21 @@ class VerboseFormatter:
     console: Console
     log_file: Path | None
     verbosity: int
-    splitter: Rule
-    file_splitter: str
+    step_name: str
 
     def __init__(self, console: Console, step_name: str, log_file: Path | None, verbosity: int):
         self.console = console
         self.log_file = log_file
         self.verbosity = verbosity
-        self.splitter = Rule(title=step_name, style="dim white")
-        self.file_splitter = "─" * 100 + "\n"
+        self.step_name = step_name
 
         self.reset_log_file()
+
+    def _print_splitter(self) -> None:
+        self.console.print(Rule(title=f"[{datetime.now().strftime('%H:%M:%S')}] {self.step_name}", style="dim white"))
+
+    def _get_file_splitter(self) -> str:
+        return datetime.now().strftime("%H:%M:%S") + " " + "─" * 100 + "\n"
 
     def reset_log_file(self) -> None:
         if self.log_file is not None and self.log_file.exists():
@@ -59,57 +64,57 @@ class VerboseFormatter:
         if self.log_file is not None:
             with open(self.log_file, "a") as f:
                 f.write(f"Error: {message}\n")
-                f.write(self.file_splitter)
+                f.write(self._get_file_splitter())
 
-        self.console.print(self.splitter)
+        self._print_splitter()
         self.console.print("Error: " + message, style=COLORS["error"], markup=False)
 
     def print_user_message(self, message: str) -> None:
         if self.log_file is not None:
             with open(self.log_file, "a") as f:
                 f.write(f"User: {message}\n")
-                f.write(self.file_splitter)
+                f.write(self._get_file_splitter())
 
         if self.verbosity == 0 or not should_verbose_log("user"):
             return
 
-        self.console.print(self.splitter)
+        self._print_splitter()
         self.console.print("User: " + message, style=COLORS["user"], markup=False)
 
     def print_agent_message(self, message: str) -> None:
         if self.log_file is not None:
             with open(self.log_file, "a") as f:
                 f.write(f"Agent: {message}\n")
-                f.write(self.file_splitter)
+                f.write(self._get_file_splitter())
 
         if self.verbosity == 0 or not should_verbose_log("agent"):
             return
 
-        self.console.print(self.splitter)
+        self._print_splitter()
         self.console.print("Agent: " + message, style=COLORS["agent"], markup=False)
 
     def print_thinking(self, message: str) -> None:
         if self.log_file is not None:
             with open(self.log_file, "a") as f:
                 f.write(f"Thinking: {message}\n")
-                f.write(self.file_splitter)
+                f.write(self._get_file_splitter())
 
         if self.verbosity == 0 or not should_verbose_log("thinking"):
             return
 
-        self.console.print(self.splitter)
+        self._print_splitter()
         self.console.print("Thinking: " + message, style=COLORS["thinking"], markup=False)
 
     def print_system_message(self, message: str) -> None:
         if self.log_file is not None:
             with open(self.log_file, "a") as f:
                 f.write(f"System: {message}\n")
-                f.write(self.file_splitter)
+                f.write(self._get_file_splitter())
 
         if self.verbosity == 0 or not should_verbose_log("system"):
             return
 
-        self.console.print(self.splitter)
+        self._print_splitter()
         self.console.print("System: " + message, style=COLORS["system"], markup=False)
 
     def print_tool_use(self, name: str, input: dict[str, Any]) -> None:
@@ -118,12 +123,12 @@ class VerboseFormatter:
                 f.write(f"Using tool: {name}\n")
                 if input:
                     f.write(json.dumps(input, indent=2) + "\n")
-                f.write(self.file_splitter)
+                f.write(self._get_file_splitter())
 
         if self.verbosity == 0 or not should_verbose_log("tool"):
             return
 
-        self.console.print(self.splitter)
+        self._print_splitter()
         self.console.print(f"Using tool: {name}", style=COLORS["tool_use"], markup=False)
         if input:
             self.console.print(input, style=COLORS["tool_input"], markup=False)
@@ -140,7 +145,7 @@ class VerboseFormatter:
                     f.write(result + "\n")
                 else:
                     f.write(json.dumps(result, indent=2) + "\n")
-                f.write(self.file_splitter)
+                f.write(self._get_file_splitter())
 
         if self.verbosity < 2 or not should_verbose_log("tool_result"):
             return
@@ -159,7 +164,7 @@ class VerboseFormatter:
                 else:
                     self.console.print(result, style=style, markup=False)
 
-        self.console.print(self.splitter)
+        self._print_splitter()
         if isinstance(result, list):
             for item in result:
                 print_single(item)
@@ -172,12 +177,12 @@ class VerboseFormatter:
                 f.write("Todo: list\n")
                 for todo in todos:
                     f.write(f"  {todo['status']}: {todo['text']}\n")
-                f.write(self.file_splitter)
+                f.write(self._get_file_splitter())
 
         if self.verbosity == 0 or not should_verbose_log("todo"):
             return
 
-        self.console.print(self.splitter)
+        self._print_splitter()
         self.console.print(
             f"📋 [{COLORS['todo_header']}]Todo list:[/{COLORS['todo_header']}]",
             highlight=False,
