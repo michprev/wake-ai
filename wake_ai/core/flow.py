@@ -125,8 +125,8 @@ class WorkflowStep:
     validation_retry_model: str | None
     max_validation_retries: int
     max_validation_retry_cost: float | None
-    pre_hook: Callable[[WorkflowStep], None] | None
-    post_hook: Callable[[WorkflowStep], None] | None
+    pre_hook: Callable[[WorkflowStep], Any] | None
+    post_hook: Callable[[WorkflowStep], Any] | None
     condition: Callable[[WorkflowStep], bool] | None
     formatter: VerboseFormatter
     additional_context: dict[str, Any]
@@ -272,8 +272,8 @@ class AIWorkflow(ABC):
         max_validation_retries: int = 3,
         max_validation_retry_cost: float | None = None,
         session: ClaudeSession | CodexSession | None = None,
-        pre_hook: Callable[[WorkflowStep], None] | None = None,
-        post_hook: Callable[[WorkflowStep], None] | None = None,
+        pre_hook: Callable[[WorkflowStep], Any] | None = None,
+        post_hook: Callable[[WorkflowStep], Any] | None = None,
         condition: Callable[[WorkflowStep], bool] | None = None,
         formatter: VerboseFormatter | None = None,
         additional_context: dict[str, Any] | None = None,
