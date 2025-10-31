@@ -357,6 +357,10 @@ class CodexSession:
         # (even if we continue an existing session)
         proc = await self._setup_process(prompt, model, formatter)
 
+        if "experimental_instructions_file" in self.additional_options:
+            instructions = Path(self.additional_options["experimental_instructions_file"]).read_text()
+            formatter.print_system_message(f"Custom instructions:\n{instructions}")
+
         formatter.print_user_message(prompt)
         terminated = False
         cost = 0.0

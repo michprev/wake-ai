@@ -197,6 +197,11 @@ class ClaudeSession:
         total_cost = 0.0
         result: ResultMessage | None = None
 
+        if isinstance(self.system_prompt, str):
+            formatter.print_system_message(f"System prompt:\n{self.system_prompt}")
+        elif isinstance(self.system_prompt, dict) and isinstance(self.system_prompt.get("append", None), str):
+            formatter.print_system_message(f"Appended system prompt:\n{self.system_prompt['append']}")
+
         formatter.print_user_message(prompt)
 
         # initial query
