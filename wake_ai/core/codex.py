@@ -124,7 +124,7 @@ class CodexSession:
         args.append("--model")
         args.append(model)
 
-        args.append("--include-plan-tool")
+        #args.append("--include-plan-tool")
 
         args.append("--cd")
         args.append(str(self.execution_dir))
@@ -270,7 +270,7 @@ class CodexSession:
             elif msg["item"]["type"] == "mcp_tool_call":
                 formatter.print_tool_use(
                     msg["item"]["server"] + "." + msg["item"]["tool"],
-                    msg["item"].get("args", {}),
+                    msg["item"].get("arguments", {}),
                 )
             elif msg["item"]["type"] == "todo_list":
                 formatter.print_todo([
@@ -312,11 +312,11 @@ class CodexSession:
                     if "result" in msg["item"]:
                         formatter.print_tool_result(
                             msg["item"]["result"]["content"],
-                            msg["item"]["result"]["isError"] or False
+                            False,
                         )
                 elif msg["item"]["status"] == "failed":
-                    if "result" in msg["item"]:
-                        formatter.print_tool_result(msg["item"]["result"], True)
+                    if "error" in msg["item"] and "message" in msg["item"]["error"]:
+                        formatter.print_tool_result(msg["item"]["error"]["message"], True)
                     else:
                         formatter.print_tool_result("MCP tool call failed", True)
                 else:
