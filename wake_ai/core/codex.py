@@ -315,8 +315,10 @@ class CodexSession:
                             False,
                         )
                 elif msg["item"]["status"] == "failed":
-                    if "error" in msg["item"] and "message" in msg["item"]["error"]:
+                    if msg["item"].get("error", None) is not None and "message" in msg["item"]["error"]:
                         formatter.print_tool_result(msg["item"]["error"]["message"], True)
+                    elif msg["item"].get("result", None) is not None and "content" in msg["item"]["result"]:
+                        formatter.print_tool_result(msg["item"]["result"]["content"], True)
                     else:
                         formatter.print_tool_result("MCP tool call failed", True)
                 else:
