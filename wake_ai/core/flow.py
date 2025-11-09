@@ -31,7 +31,7 @@ from ..utils.logging import get_verbosity_level
 def _format_duration(seconds: float) -> str:
     """Format duration dynamically based on the time scale."""
     days = int(seconds // 86400)
-    hours = int(seconds // 3600)
+    hours = int((seconds % 86400) // 3600)
     minutes = int((seconds % 3600) // 60)
     secs = seconds % 60
     if days > 0:
