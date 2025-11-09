@@ -121,6 +121,7 @@ class WorkflowStep:
     retries: int
     max_cost: float | None
     requires: list[WorkflowStep | DynamicWorkflowStep]
+    priority: int
     validator: Callable[[WorkflowStep], list[str]] | None
     validation_retry_model: str | None
     max_validation_retries: int
@@ -265,6 +266,7 @@ class AIWorkflow(ABC):
         model: str,
         *,
         requires: list[WorkflowStep | DynamicWorkflowStep[Any]] | None = None,
+        priority: int = 0,
         max_cost: float | None = None,
         retries: int = 0,
         validator: Callable[[WorkflowStep], list[str]] | None = None,
@@ -307,6 +309,7 @@ class AIWorkflow(ABC):
             retries=retries,
             max_cost=max_cost,
             requires=requires or [],
+            priority=priority,
             validator=validator,
             validation_retry_model=validation_retry_model,
             max_validation_retries=max_validation_retries,
@@ -360,7 +363,11 @@ class AIWorkflow(ABC):
         in_degree = {step: len(step.requires) for step in self.steps}
 
         # Find steps with no dependencies
-        queue = [step for step in self.steps if in_degree[step] == 0]
+        queue = sorted(
+            [step for step in self.steps if in_degree[step] == 0],
+            key=lambda s: getattr(s, "priority", 0),
+            reverse=True,
+        )
         result: list[WorkflowStep | DynamicWorkflowStep[Any]] = []
 
         while queue:
@@ -373,6 +380,8 @@ class AIWorkflow(ABC):
                     in_degree[step] -= 1
                     if in_degree[step] == 0:
                         queue.append(step)
+
+            queue.sort(key=lambda s: getattr(s, "priority", 0), reverse=True)
 
         # Check for cycles
         if len(result) != len(self.steps):
