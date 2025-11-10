@@ -204,6 +204,10 @@ class AIWorkflow(ABC):
         if execution_dir is None:
             execution_dir = cli.get("execution_dir", None)
 
+        self.execution_dir = (
+            Path(execution_dir).resolve() if execution_dir else Path.cwd()
+        )
+
         # Set up working directory
         if working_dir is not None:
             self.working_dir = Path(working_dir).resolve()
@@ -218,15 +222,11 @@ class AIWorkflow(ABC):
                 random.choices(string.ascii_lowercase + string.digits, k=6)
             )
             session_id = f"{timestamp}_{suffix}"
-            self.working_dir = Path.cwd() / ".wake" / "ai" / session_id
+            self.working_dir = self.execution_dir / ".wake" / "ai" / session_id
 
         # Create working directory
         self.working_dir.mkdir(parents=True, exist_ok=True)
         self.steps_log_file = self.working_dir / "steps.log"
-
-        self.execution_dir = (
-            Path(execution_dir).resolve() if execution_dir else Path.cwd()
-        )
 
         self.show_progress = (
             show_progress
