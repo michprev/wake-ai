@@ -180,6 +180,7 @@ class AIWorkflow(ABC):
     start_time: datetime
     steps: list[WorkflowStep | DynamicWorkflowStep[Any]]
     context: dict[str, Any]
+    status_title: str
 
     _init_called: bool
     _last_status_snapshot: tuple[Any, ...] | None
@@ -251,6 +252,7 @@ class AIWorkflow(ABC):
 
         self.steps = []
         self.context = {}
+        self.status_title = ""
         self._init_called = True
         self._last_status_snapshot = None
 
@@ -665,4 +667,4 @@ class AIWorkflow(ABC):
             self._last_status_snapshot = current_snapshot
 
         # Return panel with table and status
-        return Panel(table, title="", border_style="blue", width=84)
+        return Panel(table, title=self.status_title, border_style="blue", width=84)
