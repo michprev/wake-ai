@@ -136,7 +136,7 @@ class VerboseFormatter:
         self.console.print(splitter)
         self.console.print("System: " + message, style=COLORS["system"], markup=False)
 
-    def print_tool_use(self, name: str, input: dict[str, Any]) -> None:
+    def print_tool_use(self, name: str, input: dict[str, Any] | str) -> None:
         splitter = self._get_splitter()
         with self._file_console() as fc:
             if fc is not None:
@@ -155,9 +155,7 @@ class VerboseFormatter:
 
     def print_tool_result(self, result: str | dict[str, Any] | list[dict[str, Any]], is_error: bool) -> None:
         def print_single(console: Console, result: str | dict[str, Any]) -> None:
-            if isinstance(result, str):
-                console.print(result, style=style, markup=False)
-            else:
+            if isinstance(result, dict):
                 if "type" in result and result["type"] == "text" and "text" in result:
                     try:
                         console.print_json(result["text"])
@@ -165,6 +163,8 @@ class VerboseFormatter:
                         console.print(result["text"], style=style, markup=False)
                 else:
                     console.print(result, style=style, markup=False)
+            else:
+                console.print(result, style=style, markup=False)
 
         style = COLORS["tool_result"] if not is_error else COLORS["tool_error"]
         splitter = self._get_splitter()
