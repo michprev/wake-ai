@@ -2,12 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import datetime
+from copy import deepcopy
 from pathlib import Path
 from typing import AsyncIterator, Generator, TypedDict, Any, NamedTuple, Literal
-
-from rich.console import Console
-from rich.rule import Rule
 
 from .codex_pricing import CodexTokenPricing, GPT_PRICING
 from .verbose_formatter import VerboseFormatter
@@ -103,16 +100,16 @@ class CodexSession:
             priority=SimpleTotalTokenUsage(input_tokens=0, cached_input_tokens=0, output_tokens=0),
         )
 
-    def _update_token_usage(self, usage: SimpleTotalTokenUsage | TieredTotalTokenUsage) -> None:
+    def _update_token_usage(self, usage: SimpleTotalTokenUsage | TieredTotalTokenUsage, initial_usage: TieredTotalTokenUsage) -> None:
         if "input_tokens" in usage:
-            self.token_usage["standard"]["input_tokens"] += usage["input_tokens"]
-            self.token_usage["standard"]["cached_input_tokens"] += usage["cached_input_tokens"]
-            self.token_usage["standard"]["output_tokens"] += usage["output_tokens"]
+            self.token_usage["standard"]["input_tokens"] = usage["input_tokens"] + initial_usage["standard"]["input_tokens"]
+            self.token_usage["standard"]["cached_input_tokens"] = usage["cached_input_tokens"] + initial_usage["standard"]["cached_input_tokens"]
+            self.token_usage["standard"]["output_tokens"] = usage["output_tokens"] + initial_usage["standard"]["output_tokens"]
         else:
             for tier in ["flex", "standard", "priority"]:
-                self.token_usage[tier]["input_tokens"] += usage[tier]["input_tokens"]
-                self.token_usage[tier]["cached_input_tokens"] += usage[tier]["cached_input_tokens"]
-                self.token_usage[tier]["output_tokens"] += usage[tier]["output_tokens"]
+                self.token_usage[tier]["input_tokens"] = usage[tier]["input_tokens"] + initial_usage[tier]["input_tokens"]
+                self.token_usage[tier]["cached_input_tokens"] = usage[tier]["cached_input_tokens"] + initial_usage[tier]["cached_input_tokens"]
+                self.token_usage[tier]["output_tokens"] = usage[tier]["output_tokens"] + initial_usage[tier]["output_tokens"]
 
     async def _setup_process(self, prompt: str, model: str, formatter: VerboseFormatter) -> asyncio.subprocess.Process:
         args = [self.codex_executable, "exec", "--json"]
@@ -355,6 +352,8 @@ class CodexSession:
         else:
             raise ValueError(f"No pricing found for model '{model}'. Please provide models_pricing.")
 
+        initial_token_usage = deepcopy(self.token_usage)
+
         # each launched process starts counting tokens from the beginning
         # (even if we continue an existing session)
         proc = await self._setup_process(prompt, model, formatter)
@@ -371,7 +370,7 @@ class CodexSession:
             self._process_message(msg, formatter)
 
             if msg["type"] == "turn.completed":
-                self._update_token_usage(msg["usage"])
+                self._update_token_usage(msg["usage"], initial_token_usage)
                 cost = _compute_cost(
                     msg["usage"],
                     model_pricing,
@@ -397,7 +396,7 @@ class CodexSession:
                 self._process_message(msg, formatter)
 
                 if msg["type"] == "turn.completed":
-                    self._update_token_usage(msg["usage"])
+                    self._update_token_usage(msg["usage"], initial_token_usage)
                     cost = _compute_cost(
                         msg["usage"],
                         model_pricing,
