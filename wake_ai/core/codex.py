@@ -129,7 +129,7 @@ class CodexSession:
         args.append("--skip-git-repo-check")
 
         args.append("--sandbox")
-        args.append("workspace-write")
+        args.append("danger-full-access")
 
         args.append("-c")
         args.append(f'model_reasoning_effort="{self.reasoning_effort}"')
