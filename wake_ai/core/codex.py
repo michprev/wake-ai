@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from copy import deepcopy
 from pathlib import Path
 from typing import AsyncIterator, Generator, TypedDict, Any, NamedTuple, Literal
@@ -129,7 +130,8 @@ class CodexSession:
         args.append("--skip-git-repo-check")
 
         args.append("--sandbox")
-        args.append("danger-full-access")
+        sandbox_mode = "danger-full-access" if os.environ.get("CODEX_SANDBOX_FULL_ACCESS", "").lower() in ("1", "true", "yes") else "workspace-write"
+        args.append(sandbox_mode)
 
         args.append("-c")
         args.append(f'model_reasoning_effort="{self.reasoning_effort}"')
