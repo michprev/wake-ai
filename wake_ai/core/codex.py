@@ -65,6 +65,7 @@ class CodexSession:
     reasoning_effort: str
     models_pricing: dict[str, dict[Literal["flex", "standard", "priority"], CodexTokenPricing]] | None
     service_tier: Literal["flex", "standard", "priority"] | None
+    sandbox_mode: Literal["read-only", "workspace-write", "danger-full-access"]
     codex_executable: str
     additional_options: dict[str, Any]
 
@@ -79,6 +80,7 @@ class CodexSession:
         reasoning_effort: str = "high",
         models_pricing: dict[str, dict[Literal["flex", "standard", "priority"], CodexTokenPricing]] | None = None,
         service_tier: Literal["flex", "standard", "priority"] | None = None,
+        sandbox_mode: Literal["read-only", "workspace-write", "danger-full-access"] = "workspace-write",
         codex_executable: str = "codex",
         additional_options: dict[str, Any] | None = None,
     ):
@@ -91,6 +93,7 @@ class CodexSession:
         self.reasoning_effort = reasoning_effort
         self.models_pricing = models_pricing
         self.service_tier = service_tier
+        self.sandbox_mode = sandbox_mode
         self.codex_executable = codex_executable
         self.additional_options = additional_options or {}
 
@@ -129,7 +132,7 @@ class CodexSession:
         args.append("--skip-git-repo-check")
 
         args.append("--sandbox")
-        args.append("workspace-write")
+        args.append(self.sandbox_mode)
 
         args.append("-c")
         args.append(f'model_reasoning_effort="{self.reasoning_effort}"')
