@@ -387,13 +387,13 @@ class CodexSession:
         assert self.session_id is not None
 
         main_cost = cost
+        cost = 0.0
 
         await proc.wait()
 
         if terminated:
             formatter.print_user_message(TERMINATION_PROMPT)
             proc = await self._setup_process(TERMINATION_PROMPT, model, formatter)
-            cost = 0.0
 
             async for msg in self._receive_messages(proc):
                 self._process_message(msg, formatter)
