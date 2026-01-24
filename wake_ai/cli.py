@@ -24,7 +24,7 @@ console = Console()
 root_logger = logging.getLogger()
 if not root_logger.handlers:
     logging.basicConfig(
-        level=logging.INFO,
+        level=logging.WARNING,
         format="%(message)s",
         datefmt="[%X]",
         handlers=[RichHandler(console=console, rich_tracebacks=True, show_path=False)]
