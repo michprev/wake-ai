@@ -23,6 +23,7 @@ from rich.traceback import Traceback
 from .claude import ClaudeSession
 from .codex import CodexSession
 from .codex_pricing import GPT_PRICING
+from .session_abc import SessionABC
 from .verbose_formatter import VerboseFormatter
 from ..results import AIResult
 from ..utils.logging import get_verbosity_level
@@ -117,7 +118,7 @@ class WorkflowStep:
     name: str
     prompt: str | Path
     model: str
-    session: ClaudeSession | CodexSession
+    session: SessionABC
     retries: int
     max_cost: float | None
     requires: list[WorkflowStep | DynamicWorkflowStep]
@@ -275,7 +276,7 @@ class AIWorkflow(ABC):
         validation_retry_model: str | None = None,
         max_validation_retries: int = 3,
         max_validation_retry_cost: float | None = None,
-        session: ClaudeSession | CodexSession | None = None,
+        session: SessionABC | None = None,
         pre_hook: Callable[[WorkflowStep], Any] | None = None,
         post_hook: Callable[[WorkflowStep], Any] | None = None,
         condition: Callable[[WorkflowStep], bool] | None = None,

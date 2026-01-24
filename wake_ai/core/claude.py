@@ -6,6 +6,7 @@ from typing import AsyncIterator, NamedTuple, Literal
 from claude_agent_sdk import AgentDefinition, AssistantMessage, ClaudeAgentOptions, McpServerConfig, Message, ResultMessage, SystemMessage, TextBlock, ThinkingBlock, ToolResultBlock, ToolUseBlock, UserMessage, query
 from claude_agent_sdk.types import SystemPromptPreset
 
+from .session_abc import SessionABC
 from .verbose_formatter import VerboseFormatter
 from ..utils.logging import get_logger
 
@@ -54,10 +55,10 @@ class ClaudeResponse(NamedTuple):
     status: Literal["running", "terminating_on_max_cost", "succeeded", "terminated", "errored"]
 
 
-class ClaudeSession:
+class ClaudeSession(SessionABC):
     execution_dir: Path
     working_dir: Path
-    session_id: str | None
+    _session_id: str | None
     allowed_tools: list[str]
     disallowed_tools: list[str]
     mcp_servers: dict[str, McpServerConfig]
@@ -83,7 +84,7 @@ class ClaudeSession:
 
         self.execution_dir = execution_dir
         self.working_dir = working_dir
-        self.session_id = session_id
+        self._session_id = session_id
 
         if allowed_tools is None:
             allowed_tools = list(DEFAULT_ALLOWED_TOOLS)
@@ -104,6 +105,10 @@ class ClaudeSession:
 
         self.system_prompt = system_prompt
         self.fork_session = fork_session
+
+    @property
+    def session_id(self) -> str | None:
+        return self._session_id
 
     def _process_message(self, message: Message, formatter: VerboseFormatter) -> None:
         if isinstance(message, UserMessage):
@@ -150,11 +155,11 @@ class ClaudeSession:
         elif isinstance(message, SystemMessage):
             if message.subtype == "init":
                 if "session_id" in message.data:
-                    if self.session_id is None:
-                        self.session_id = message.data["session_id"]
+                    if self._session_id is None:
+                        self._session_id = message.data["session_id"]
                     else:
                         # sanity check
-                        assert self.session_id == message.data["session_id"]
+                        assert self._session_id == message.data["session_id"]
 
                 status = (
                     f"System: {message.subtype}\n"
@@ -175,15 +180,15 @@ class ClaudeSession:
             if isinstance(self.fork_session, str):
                 fork_session_id = self.fork_session
             else:
-                if self.fork_session.session_id is None:
+                if self.fork_session._session_id is None:
                     raise RuntimeError("Forking from ClaudeSession without assigned session id")
-                fork_session_id = self.fork_session.session_id
+                fork_session_id = self.fork_session._session_id
 
         options = ClaudeAgentOptions(
             system_prompt=self.system_prompt,
             allowed_tools=self.allowed_tools,
             disallowed_tools=self.disallowed_tools,
-            resume=self.session_id or fork_session_id,
+            resume=self._session_id or fork_session_id,
             model=model,
             cwd=str(self.execution_dir),  # Set working directory for command execution
             permission_mode="default",
@@ -214,9 +219,9 @@ class ClaudeSession:
         assert result is not None
         total_cost += result.total_cost_usd or 0.0
 
-        assert self.session_id is not None
+        assert self._session_id is not None
         # from now on we must keep using the same session id
-        options.resume = self.session_id
+        options.resume = self._session_id
         options.fork_session = False
 
         while result.subtype == "error_max_turns" and (max_cost is None or total_cost < max_cost):
@@ -265,4 +270,4 @@ class ClaudeSession:
         """
         Reset the session ID
         """
-        self.session_id = None
+        self._session_id = None

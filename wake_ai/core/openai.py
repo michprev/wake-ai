@@ -1,0 +1,473 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import platform
+import random
+import uuid
+from pathlib import Path
+from typing import AsyncIterator, Awaitable, NamedTuple, Literal, Any, Callable
+
+import httpx
+from openai import APIError, AsyncOpenAI, omit
+from openai.types.conversations import Conversation
+from openai.types.responses import FunctionToolParam, ResponseAudioDeltaEvent, ResponseCompletedEvent, ResponseCreatedEvent, ResponseFunctionCallArgumentsDeltaEvent, ResponseFunctionCallArgumentsDoneEvent, ResponseFunctionShellCallOutputContentParam, ResponseFunctionShellToolCall, ResponseFunctionToolCall, ResponseInProgressEvent, ResponseOutputItemAddedEvent, ResponseOutputItemDoneEvent, ResponseOutputMessage, ResponseOutputRefusal, ResponseOutputText, ResponseReasoningItem, ResponseTextConfigParam, ResponseTextDeltaEvent, ResponseTextDoneEvent, ToolParam
+from openai.types.responses.function_shell_tool import FunctionShellTool
+from openai.types.responses.response_function_shell_call_output_content_param import OutcomeExit, OutcomeTimeout
+from openai.types.responses.response_input_param import FunctionCallOutput, ShellCallOutput
+from openai.types.shared_params import ResponseFormatText
+from openai.types.shared_params.reasoning import Reasoning
+
+from .codex_pricing import GPT_PRICING
+from .seatbelt import run_under_seatbelt
+from .session_abc import SessionABC
+from .verbose_formatter import VerboseFormatter
+from ..utils.logging import get_logger
+
+logger = get_logger(__name__)
+
+
+class OpenAIResponse(NamedTuple):
+    cost: float
+    status: Literal["running", "terminating_on_max_cost", "succeeded", "terminated", "errored"]
+
+
+class FunctionTool(NamedTuple):
+    name: str
+    input_schema: dict[str, Any]
+    description: str | None
+    handler: Callable[..., Awaitable[Any]]
+
+
+def _compute_backoff_time(retry: int) -> float:
+    # base time is 20 seconds, exponential growth; 10% jitter
+    # retry starts at 0
+    exp = 2.0 ** retry
+    base = 20 * exp
+    return base * random.uniform(0.9, 1.1)
+
+
+LEGACY_SHELL_INPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "commands": {
+            "type": "array",
+            "description": "A list of shell commands to execute. Execution in order is NOT guaranteed.",
+            "items": {
+                "type": "string",
+            },
+        },
+        "timeout_ms": {
+            "type": "number",
+            "description": "The timeout in milliseconds for each command.",
+        },
+        "max_output_length": {
+            "type": "integer",
+            "description": "The maximum output length in characters for each command.",
+        },
+    },
+    "required": ["commands", "timeout_ms"],
+}
+
+
+class OpenAITokenUsage:
+    input_tokens_total: int
+    input_tokens_cached: int
+    output_tokens: int
+
+    def __init__(self, input_tokens_total: int = 0, input_tokens_cached: int = 0, output_tokens: int = 0) -> None:
+        self.input_tokens_total = input_tokens_total
+        self.input_tokens_cached = input_tokens_cached
+        self.output_tokens = output_tokens
+
+    def update(self, input_tokens_total: int, input_tokens_cached: int, output_tokens: int) -> None:
+        self.input_tokens_total += input_tokens_total
+        self.input_tokens_cached += input_tokens_cached
+        self.output_tokens += output_tokens
+
+    def compute_cost(self, model: str, tier: Literal["flex", "standard", "priority"] = "standard") -> float:
+        return (
+            (self.input_tokens_total - self.input_tokens_cached) * GPT_PRICING[model][tier].input_mtoken_cost / 1e6
+            + self.input_tokens_cached * GPT_PRICING[model][tier].cached_input_mtoken_cost / 1e6
+            + self.output_tokens * GPT_PRICING[model][tier].output_mtoken_cost / 1e6
+        )
+
+
+class OpenAITotalTokenUsage:
+    usage: dict[str, dict[Literal["flex", "standard", "priority"], OpenAITokenUsage]]
+
+    def __init__(self) -> None:
+        self.usage = {}
+
+    @property
+    def total_tokens(self) -> OpenAITokenUsage:
+        return OpenAITokenUsage(
+            input_tokens_total=sum(usage.input_tokens_total for tiered_usage in self.usage.values() for usage in tiered_usage.values()),
+            input_tokens_cached=sum(usage.input_tokens_cached for tiered_usage in self.usage.values() for usage in tiered_usage.values()),
+            output_tokens=sum(usage.output_tokens for tiered_usage in self.usage.values() for usage in tiered_usage.values()),
+        )
+
+    @property
+    def total_cost(self) -> float:
+        total_cost = 0.0
+        for model, tiered_usage in self.usage.items():
+            for tier, usage in tiered_usage.items():
+                total_cost += usage.compute_cost(model, tier)
+        return total_cost
+
+    def update(
+        self,
+        input_tokens_total: int,
+        input_tokens_cached: int,
+        output_tokens: int,
+        model: str,
+        tier: Literal["flex", "standard", "priority"],
+    ) -> None:
+        if model not in self.usage:
+            self.usage[model] = {
+                "flex": OpenAITokenUsage(),
+                "standard": OpenAITokenUsage(),
+                "priority": OpenAITokenUsage(),
+            }
+        self.usage[model][tier].update(input_tokens_total, input_tokens_cached, output_tokens)
+
+
+class OpenAISession(SessionABC):
+    execution_dir: Path
+    working_dir: Path
+    fork_session: OpenAISession | None
+    instructions: str | None
+    service_tier: Literal["auto", "default", "flex", "scale", "priority"] | None
+    reasoning_effort: Literal["none", "low", "medium", "high", "xhigh"] | None
+    reasoning_summary: Literal["auto", "concise", "detailed"] | None
+    output_verbosity: Literal["low", "medium", "high"] | None
+    max_retries: int
+    request_timeout: float | None
+    tools: dict[str, FunctionTool]
+    shell: bool
+
+    client: AsyncOpenAI
+    _session_id: str | None
+    last_message_id: str | None
+    total_token_usage: OpenAITotalTokenUsage
+
+    def __init__(
+        self,
+        execution_dir: Path,
+        working_dir: Path,
+        *,
+        fork_session: OpenAISession | None = None,
+        instructions: str | None = None,
+        service_tier: Literal["auto", "default", "flex", "scale", "priority"] | None = None,
+        reasoning_effort: Literal["none", "low", "medium", "high", "xhigh"] | None = None,
+        reasoning_summary: Literal["auto", "concise", "detailed"] | None = None,
+        output_verbosity: Literal["low", "medium", "high"] | None = None,
+        max_retries: int = 5,
+        request_timeout: float | None = 600,  # 10 minutes
+        tools: list[FunctionTool] | None = None,
+        shell: bool = True,
+    ):
+        self.execution_dir = execution_dir
+        self.working_dir = working_dir
+        self.fork_session = fork_session
+        self.instructions = instructions
+        self.service_tier = service_tier
+        self.reasoning_effort = reasoning_effort
+        self.reasoning_summary = reasoning_summary
+        self.output_verbosity = output_verbosity
+        self.max_retries = max_retries
+        self.request_timeout = request_timeout
+        self.shell = shell
+
+        self.tools = {}
+        if tools is not None:
+            for tool in tools:
+                self.tools[tool.name] = tool
+
+        self.client = AsyncOpenAI(
+            api_key=os.getenv("OPENAI_API_KEY"),
+        )
+        if fork_session is not None:
+            if fork_session.last_message_id is None:
+                raise ValueError("Forking from OpenAISession without assigned last message id")
+            self.last_message_id = fork_session.last_message_id
+        else:
+            self.last_message_id = None
+        self._session_id = None
+        self.total_token_usage = OpenAITotalTokenUsage()
+
+    @property
+    def session_id(self) -> str | None:
+        return self._session_id
+
+    async def _call_tool(self, tool_call: ResponseFunctionToolCall) -> Any:
+        tool = self.tools[tool_call.name]
+
+        if tool_call.arguments:
+            input = json.loads(tool_call.arguments)
+        else:
+            input = {}
+
+        return await tool.handler(**input)
+
+    async def _call_shell(self, commands: list[str], timeout_ms: int | None, max_output_length: int | None) -> list[ResponseFunctionShellCallOutputContentParam]:
+        if platform.system() != "Darwin":
+            raise NotImplementedError("Shell tools are only supported on macOS")
+
+        timeout = timeout_ms / 1000.0 if timeout_ms is not None else None
+        max_length = max_output_length if max_output_length is not None else 1000000
+
+        output: list[ResponseFunctionShellCallOutputContentParam] = []
+
+        for command in commands:
+            try:
+                stdout, stderr, returncode = await run_under_seatbelt(command, False, [self.working_dir], timeout, self.execution_dir)
+
+                output.append(ResponseFunctionShellCallOutputContentParam(
+                    outcome=OutcomeExit(
+                        exit_code=returncode,
+                        type="exit",
+                    ),
+                    stderr=stderr[:max_length],
+                    stdout=stdout[:max_length],
+                ))
+            except asyncio.TimeoutError:
+                output.append(ResponseFunctionShellCallOutputContentParam(
+                    outcome=OutcomeTimeout(
+                        type="timeout",
+                    ),
+                    stderr="",
+                    stdout="",
+                ))
+
+        return output
+
+    async def _call_legacy_shell(self, arguments: str) -> list[ResponseFunctionShellCallOutputContentParam]:
+        args = json.loads(arguments)
+        if "commands" not in args:
+            raise ValueError("commands not found in arguments")
+        if "timeout_ms" not in args:
+            raise ValueError("timeout_ms not found in arguments")
+
+        return await self._call_shell(args["commands"], args["timeout_ms"], args.get("max_output_length", None))
+
+    async def _stream_messages(self, prompt: str, model: str, formatter: VerboseFormatter) -> AsyncIterator[float]:
+        input = prompt
+
+        tools: list[ToolParam] = [
+            FunctionToolParam(
+                name=tool.name,
+                parameters=tool.input_schema,
+                description=tool.description,
+                type="function",
+                strict=False,
+            ) for tool in self.tools.values()
+        ]
+
+        if self.shell:
+            if not model.startswith("gpt-5.1") and not model.startswith("gpt-5.2"):
+                tools.append(FunctionToolParam(
+                    name="shell",
+                    parameters=LEGACY_SHELL_INPUT_SCHEMA,
+                    description="Execute multiple shell commands in parallel",
+                    type="function",
+                    strict=False,
+                ))
+            else:
+                tools.append(FunctionShellTool(type="shell"))
+
+        retry = 0
+        service_tier = self.service_tier or "standard"
+        last_flex_successful = True
+
+        while True:
+            try:
+                stream = await self.client.responses.create(
+                    input=input,
+                    model=model,
+                    instructions=self.instructions or omit,
+                    service_tier="default" if service_tier == "standard" else service_tier,
+                    tools=tools or omit,
+                    stream=True,
+                    previous_response_id=self.last_message_id or omit,
+                    reasoning=Reasoning(
+                        effort=self.reasoning_effort,
+                        summary=self.reasoning_summary,
+                    ),
+                    text=ResponseTextConfigParam(
+                        format=ResponseFormatText(
+                            type="text",
+                        ),
+                        verbosity=self.output_verbosity,
+                    ),
+                    timeout=self.request_timeout,
+                )
+
+                response = None
+                tool_calls: dict[str, asyncio.Task[Any]] = {}
+                shell_calls: dict[str, tuple[asyncio.Task[list[ResponseFunctionShellCallOutputContentParam]], ResponseFunctionShellToolCall]] = {}
+
+                async for event in stream:
+                    if isinstance(event, ResponseCreatedEvent):
+                        self.last_message_id = event.response.id
+                    elif isinstance(event, ResponseInProgressEvent):
+                        pass
+                    elif isinstance(event, ResponseTextDeltaEvent):
+                        pass
+                    elif isinstance(event, ResponseTextDoneEvent):
+                        pass  # already printed in ResponseOutputItemDoneEvent - ResponseOutputMessage
+                    elif isinstance(event, ResponseOutputItemAddedEvent):
+                        pass
+                    elif isinstance(event, ResponseOutputItemDoneEvent):
+                        if isinstance(event.item, ResponseOutputMessage):
+                            for content in event.item.content:
+                                if isinstance(content, ResponseOutputText):
+                                    formatter.print_agent_message(content.text)
+                                elif isinstance(content, ResponseOutputRefusal):
+                                    formatter.print_agent_message(content.refusal)
+                        elif isinstance(event.item, ResponseFunctionToolCall):
+                            formatter.print_tool_use(event.item.name, event.item.arguments)
+
+                            if event.item.name == "shell" and not model.startswith("gpt-5.1") and not model.startswith("gpt-5.2"):
+                                tool_calls[event.item.call_id] = asyncio.create_task(self._call_legacy_shell(event.item.arguments))
+                            else:
+                                tool_calls[event.item.call_id] = asyncio.create_task(self._call_tool(event.item))
+                        elif isinstance(event.item, ResponseReasoningItem):
+                            for summary in event.item.summary:
+                                formatter.print_thinking(summary.text)
+                        elif isinstance(event.item, ResponseFunctionShellToolCall):
+                            for command in event.item.action.commands:
+                                if event.item.action.timeout_ms is not None:
+                                    tool_name = f"bash (timeout: {event.item.action.timeout_ms / 1000.0}s)"
+                                else:
+                                    tool_name = "bash"
+                                formatter.print_tool_use(tool_name, command)
+                            shell_calls[event.item.call_id] = (
+                                asyncio.create_task(
+                                    self._call_shell(
+                                        event.item.action.commands,
+                                        event.item.action.timeout_ms,
+                                        event.item.action.max_output_length,
+                                    )
+                                ),
+                                event.item,
+                            )
+                        else:
+                            assert False, f"Unexpected item type: {type(event.item)}"
+
+                    elif isinstance(event, ResponseCompletedEvent):
+                        response = event.response
+                        if response.usage is not None:
+                            self.total_token_usage.update(
+                                input_tokens_total=response.usage.input_tokens,
+                                input_tokens_cached=response.usage.input_tokens_details.cached_tokens,
+                                output_tokens=response.usage.output_tokens,
+                                model=model,
+                                tier=service_tier,
+                            )
+                    elif isinstance(event, ResponseFunctionCallArgumentsDoneEvent):
+                        pass
+                    elif isinstance(event, ResponseFunctionCallArgumentsDeltaEvent):
+                        pass
+                    elif isinstance(event, ResponseAudioDeltaEvent):
+                        pass
+                    else:
+                        pass
+            except (APIError, httpx.RemoteProtocolError, httpx.TimeoutException) as e:
+                formatter.print_error(f"Request failed with tier {service_tier}: {e}")
+
+                if service_tier == "flex":
+                    if last_flex_successful:
+                        max_retries = self.max_retries
+                    else:
+                        max_retries = 0
+                else:
+                    max_retries = self.max_retries
+
+                if retry < max_retries:
+                    logger.warning(f"Request failed with tier {service_tier}, retrying... ({retry}/{max_retries}) with backoff time {_compute_backoff_time(retry)}")
+                    await asyncio.sleep(_compute_backoff_time(retry))
+                    retry += 1
+                    continue
+                else:
+                    if service_tier == "flex":
+                        # reset retries, set flag & switch to standard
+                        last_flex_successful = False
+                        retry = 0
+                        service_tier = "standard"
+                        logger.warning(f"Switching to standard tier after {max_retries} retries")
+                        continue
+                    raise e
+
+            retry = 0
+            if service_tier == "flex":
+                last_flex_successful = True
+            if self.service_tier == "flex":
+                service_tier = "flex"
+
+            assert response is not None
+
+            yield self.total_token_usage.total_cost
+
+            if not tool_calls and not shell_calls:
+                break
+
+            input = []
+            shell_tasks = [task for task, _ in shell_calls.values()]
+            await asyncio.gather(*tool_calls.values(), *shell_tasks, return_exceptions=True)
+
+            for call_id, task in tool_calls.items():
+                if task.exception() is not None:
+                    formatter.print_tool_result(str(task.exception()), True)
+                else:
+                    formatter.print_tool_result(task.result(), False)
+
+                input.append(FunctionCallOutput(
+                    call_id=call_id,
+                    output=json.dumps(str(task.exception()) if task.exception() else task.result()),
+                    type="function_call_output",
+                ))
+
+            for call_id, (task, shell_call) in shell_calls.items():
+                for output in task.result():
+                    if output["outcome"]["type"] == "exit":
+                        if output["outcome"]["exit_code"] != 0:
+                            formatter.print_tool_result(output["stderr"], True)
+                        else:
+                            formatter.print_tool_result(output["stdout"], False)
+                    elif output["outcome"]["type"] == "timeout":
+                        formatter.print_tool_result("Shell command timed out", True)
+                    else:
+                        assert False, f"Unexpected outcome: {output['outcome']}"
+
+                input.append(ShellCallOutput(
+                    call_id=call_id,
+                    output=task.result(),
+                    type="shell_call_output",
+                    max_output_length=shell_call.action.max_output_length,
+                ))
+
+    async def query(self, prompt: str, model: str, max_cost: float | None, formatter: VerboseFormatter) -> AsyncIterator[OpenAIResponse]:
+        if model.lower() not in GPT_PRICING:
+            raise ValueError(f"Model '{model}' not supported")
+
+        if self._session_id is None:
+            self._session_id = uuid.uuid4().hex
+
+        formatter.print_user_message(prompt)
+
+        initial_cost = self.total_token_usage.total_cost
+
+        async for total_cost in self._stream_messages(prompt, model, formatter):
+            yield OpenAIResponse(cost=total_cost - initial_cost, status="running")
+
+        yield OpenAIResponse(cost=self.total_token_usage.total_cost - initial_cost, status="succeeded")
+
+
+    def reset(self) -> None:
+        """
+        Reset the session ID
+        """
+        self.last_message_id = None
+        self._session_id = None

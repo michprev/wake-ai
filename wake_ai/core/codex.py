@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import AsyncIterator, Generator, TypedDict, Any, NamedTuple, Literal
 
 from .codex_pricing import CodexTokenPricing, GPT_PRICING
+from .session_abc import SessionABC
 from .verbose_formatter import VerboseFormatter
 from ..utils.logging import get_logger
 
@@ -58,9 +59,9 @@ class CodexResponse(NamedTuple):
     status: Literal["running", "terminating_on_max_cost", "succeeded", "terminated", "errored"]
 
 
-class CodexSession:
+class CodexSession(SessionABC):
     execution_dir: Path
-    session_id: str | None
+    _session_id: str | None
     fork_session: str | CodexSession | None
     reasoning_effort: str
     models_pricing: dict[str, dict[Literal["flex", "standard", "priority"], CodexTokenPricing]] | None
@@ -88,7 +89,7 @@ class CodexSession:
             raise ValueError("session_id and fork_session cannot be used together")
 
         self.execution_dir = execution_dir
-        self.session_id = session_id
+        self._session_id = session_id
         self.fork_session = fork_session
         self.reasoning_effort = reasoning_effort
         self.models_pricing = models_pricing
@@ -102,6 +103,10 @@ class CodexSession:
             standard=SimpleTotalTokenUsage(input_tokens=0, cached_input_tokens=0, output_tokens=0),
             priority=SimpleTotalTokenUsage(input_tokens=0, cached_input_tokens=0, output_tokens=0),
         )
+
+    @property
+    def session_id(self) -> str | None:
+        return self._session_id
 
     def _update_token_usage(self, usage: SimpleTotalTokenUsage | TieredTotalTokenUsage, initial_usage: TieredTotalTokenUsage) -> None:
         if "input_tokens" in usage:
@@ -146,18 +151,18 @@ class CodexSession:
             else:
                 args.append(f"{key}='{value}'")
 
-        if self.session_id is not None:
+        if self._session_id is not None:
             args.append("resume")
-            args.append(self.session_id)
+            args.append(self._session_id)
         elif self.fork_session is not None:
             args.append("resume")
 
             if isinstance(self.fork_session, str):
                 args.append(self.fork_session)
             else:
-                if self.fork_session.session_id is None:
+                if self.fork_session._session_id is None:
                     raise RuntimeError("Forking from CodexSession without assigned session id")
-                args.append(self.fork_session.session_id)
+                args.append(self.fork_session._session_id)
 
             args.append("--fork")
 
@@ -334,10 +339,10 @@ class CodexSession:
             else:
                 logger.warning(f"Unexpected Codex item.completed message: {msg}")
         elif msg["type"] == "thread.started":
-            if self.session_id is None:
-                self.session_id = msg["thread_id"]
+            if self._session_id is None:
+                self._session_id = msg["thread_id"]
             else:
-                assert self.session_id == msg["thread_id"]
+                assert self._session_id == msg["thread_id"]
         elif msg["type"] == "turn.started":
             pass
         elif msg["type"] == "turn.completed":
@@ -384,7 +389,7 @@ class CodexSession:
                     proc.terminate()
                     terminated = True
 
-        assert self.session_id is not None
+        assert self._session_id is not None
 
         main_cost = cost
         cost = 0.0
@@ -412,5 +417,5 @@ class CodexSession:
         """
         Reset the session ID
         """
-        self.session_id = None
+        self._session_id = None
         # keep token_usage
