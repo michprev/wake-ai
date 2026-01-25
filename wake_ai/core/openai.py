@@ -169,6 +169,8 @@ class OpenAISession(SessionABC):
     tools: dict[str, FunctionTool]
     shell: bool
     mcps: dict[str, ClientSession | StdioServerParameters | SSEServerParameters | StreamableHTTPServerParameters]
+    network_access: bool
+    writable_roots: list[Path | str]
 
     client: AsyncOpenAI
     _session_id: str | None
@@ -191,6 +193,8 @@ class OpenAISession(SessionABC):
         tools: list[FunctionTool] | None = None,
         shell: bool = True,
         mcps: dict[str, ClientSession | StdioServerParameters | SSEServerParameters | StreamableHTTPServerParameters] | None = None,
+        network_access: bool = False,
+        writable_roots: list[Path | str] | None = None,
     ):
         self.execution_dir = execution_dir
         self.working_dir = working_dir
@@ -204,6 +208,8 @@ class OpenAISession(SessionABC):
         self.request_timeout = request_timeout
         self.shell = shell
         self.mcps = mcps or {}
+        self.network_access = network_access
+        self.writable_roots = writable_roots or []
 
         self.tools = {}
         if tools is not None:
@@ -247,7 +253,8 @@ class OpenAISession(SessionABC):
 
         for command in commands:
             try:
-                stdout, stderr, returncode = await run_under_seatbelt(command, False, [self.working_dir], timeout, self.execution_dir)
+                writable_roots = [self.working_dir] + [Path(root) for root in self.writable_roots]
+                stdout, stderr, returncode = await run_under_seatbelt(command, self.network_access, writable_roots, timeout, self.execution_dir)
 
                 output.append(ResponseFunctionShellCallOutputContentParam(
                     outcome=OutcomeExit(
