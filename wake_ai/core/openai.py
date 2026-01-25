@@ -6,12 +6,17 @@ import os
 import platform
 import random
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import AsyncIterator, Awaitable, NamedTuple, Literal, Any, Callable
 
 import httpx
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
+from mcp.client.sse import sse_client
+from mcp.client.streamable_http import streamablehttp_client
+from mcp.types import TextContent
 from openai import APIError, AsyncOpenAI, omit
-from openai.types.conversations import Conversation
 from openai.types.responses import FunctionToolParam, ResponseAudioDeltaEvent, ResponseCompletedEvent, ResponseCreatedEvent, ResponseFunctionCallArgumentsDeltaEvent, ResponseFunctionCallArgumentsDoneEvent, ResponseFunctionShellCallOutputContentParam, ResponseFunctionShellToolCall, ResponseFunctionToolCall, ResponseInProgressEvent, ResponseOutputItemAddedEvent, ResponseOutputItemDoneEvent, ResponseOutputMessage, ResponseOutputRefusal, ResponseOutputText, ResponseReasoningItem, ResponseTextConfigParam, ResponseTextDeltaEvent, ResponseTextDoneEvent, ToolParam
 from openai.types.responses.function_shell_tool import FunctionShellTool
 from openai.types.responses.response_function_shell_call_output_content_param import OutcomeExit, OutcomeTimeout
@@ -133,6 +138,23 @@ class OpenAITotalTokenUsage:
         self.usage[model][tier].update(input_tokens_total, input_tokens_cached, output_tokens)
 
 
+@dataclass
+class SSEServerParameters:
+    url: str
+    headers: dict[str, str] | None = None
+    timeout: float = 5
+    sse_read_timeout: float = 60 * 5
+
+
+@dataclass
+class StreamableHTTPServerParameters:
+    url: str
+    headers: dict[str, str] | None = None
+    timeout: float = 5
+    sse_read_timeout: float = 60 * 5
+    terminate_on_close: bool = False
+
+
 class OpenAISession(SessionABC):
     execution_dir: Path
     working_dir: Path
@@ -146,6 +168,7 @@ class OpenAISession(SessionABC):
     request_timeout: float | None
     tools: dict[str, FunctionTool]
     shell: bool
+    mcps: dict[str, ClientSession | StdioServerParameters | SSEServerParameters | StreamableHTTPServerParameters]
 
     client: AsyncOpenAI
     _session_id: str | None
@@ -167,6 +190,7 @@ class OpenAISession(SessionABC):
         request_timeout: float | None = 600,  # 10 minutes
         tools: list[FunctionTool] | None = None,
         shell: bool = True,
+        mcps: dict[str, ClientSession | StdioServerParameters | SSEServerParameters | StreamableHTTPServerParameters] | None = None,
     ):
         self.execution_dir = execution_dir
         self.working_dir = working_dir
@@ -179,6 +203,7 @@ class OpenAISession(SessionABC):
         self.max_retries = max_retries
         self.request_timeout = request_timeout
         self.shell = shell
+        self.mcps = mcps or {}
 
         self.tools = {}
         if tools is not None:
@@ -252,7 +277,18 @@ class OpenAISession(SessionABC):
 
         return await self._call_shell(args["commands"], args["timeout_ms"], args.get("max_output_length", None))
 
-    async def _stream_messages(self, prompt: str, model: str, formatter: VerboseFormatter) -> AsyncIterator[float]:
+    async def _call_mcp_tool(self, client: ClientSession, tool_name: str, arguments: str) -> Any:
+        args = json.loads(arguments)
+
+        # TODO: read timeout seconds
+        result = await client.call_tool(tool_name, args)
+
+        if result.structuredContent is not None:
+            return {"isError": result.isError, "structuredContent": result.structuredContent}
+        else:
+            return {"isError": result.isError, "content": "\n".join(c.text for c in result.content if isinstance(c, TextContent))}
+
+    async def _stream_messages(self, prompt: str, model: str, mcp_clients: dict[str, ClientSession], formatter: VerboseFormatter) -> AsyncIterator[float]:
         input = prompt
 
         tools: list[ToolParam] = [
@@ -264,6 +300,29 @@ class OpenAISession(SessionABC):
                 strict=False,
             ) for tool in self.tools.values()
         ]
+
+        mcp_tools: dict[str, tuple[str, ClientSession]] = {}
+
+        for server_name, client in mcp_clients.items():
+            cursor = None
+            while True:
+                response = await client.list_tools(cursor=cursor)
+                for tool in response.tools:
+                    if f"{server_name}.{tool.name}" in self.tools:
+                        raise ValueError(f"Tool '{f"{server_name}.{tool.name}"}' already exists")
+
+                    mcp_tools[f"{server_name}.{tool.name}"] = (tool.name, client)
+
+                    tools.append(FunctionToolParam(
+                        name=f"{server_name}.{tool.name}",
+                        parameters=tool.inputSchema,
+                        description=tool.description,
+                        type="function",
+                        strict=False,
+                    ))
+                if response.nextCursor is None:
+                    break
+                cursor = response.nextCursor
 
         if self.shell:
             if not model.startswith("gpt-5.1") and not model.startswith("gpt-5.2"):
@@ -331,6 +390,8 @@ class OpenAISession(SessionABC):
 
                             if event.item.name == "shell" and not model.startswith("gpt-5.1") and not model.startswith("gpt-5.2"):
                                 tool_calls[event.item.call_id] = asyncio.create_task(self._call_legacy_shell(event.item.arguments))
+                            elif event.item.name in mcp_tools:
+                                tool_calls[event.item.call_id] = asyncio.create_task(self._call_mcp_tool(mcp_tools[event.item.name][1], mcp_tools[event.item.name][0], event.item.arguments))
                             else:
                                 tool_calls[event.item.call_id] = asyncio.create_task(self._call_tool(event.item))
                         elif isinstance(event.item, ResponseReasoningItem):
@@ -455,14 +516,43 @@ class OpenAISession(SessionABC):
         if self._session_id is None:
             self._session_id = uuid.uuid4().hex
 
-        formatter.print_user_message(prompt)
+        mcp_clients = {}
+        opened_clients = []
 
-        initial_cost = self.total_token_usage.total_cost
+        try:
+            for server_name, info in self.mcps.items():
+                if isinstance(info, ClientSession):
+                    mcp_clients[server_name] = info
+                else:
+                    if isinstance(info, StdioServerParameters):
+                        handle = stdio_client(info)
+                    elif isinstance(info, SSEServerParameters):
+                        handle = sse_client(info.url, info.headers, info.timeout, info.sse_read_timeout)
+                    elif isinstance(info, StreamableHTTPServerParameters):
+                        handle = streamablehttp_client(info.url, info.headers, info.timeout, info.sse_read_timeout, info.terminate_on_close)
+                    else:
+                        raise ValueError(f"Unknown MCP server type: {type(info)}")
 
-        async for total_cost in self._stream_messages(prompt, model, formatter):
-            yield OpenAIResponse(cost=total_cost - initial_cost, status="running")
+                    read, write = await handle.__aenter__()
+                    opened_clients.append(handle)
 
-        yield OpenAIResponse(cost=self.total_token_usage.total_cost - initial_cost, status="succeeded")
+                    # TODO: read timeout seconds
+                    client = ClientSession(read, write)
+
+                    mcp_clients[server_name] = await client.__aenter__()
+                    opened_clients.append(client)
+
+            formatter.print_user_message(prompt)
+
+            initial_cost = self.total_token_usage.total_cost
+
+            async for total_cost in self._stream_messages(prompt, model, mcp_clients, formatter):
+                yield OpenAIResponse(cost=total_cost - initial_cost, status="running")
+
+            yield OpenAIResponse(cost=self.total_token_usage.total_cost - initial_cost, status="succeeded")
+        finally:
+            for client in reversed(opened_clients):
+                await client.__aexit__(None, None, None)
 
 
     def reset(self) -> None:
