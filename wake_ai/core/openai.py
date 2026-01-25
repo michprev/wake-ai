@@ -451,7 +451,7 @@ class OpenAISession(SessionABC):
                     max_retries = self.max_retries
 
                 if retry < max_retries:
-                    logger.warning(f"Request failed with tier {service_tier}, retrying... ({retry}/{max_retries}) with backoff time {_compute_backoff_time(retry)}")
+                    logger.warning(f"Request failed with tier {service_tier}, retrying... ({retry+1}/{max_retries}) with backoff time {_compute_backoff_time(retry)}")
                     await asyncio.sleep(_compute_backoff_time(retry))
                     retry += 1
                     continue
