@@ -157,7 +157,6 @@ class StreamableHTTPServerParameters:
 
 class OpenAISession(SessionABC):
     execution_dir: Path
-    working_dir: Path
     fork_session: OpenAISession | None
     instructions: str | None
     service_tier: Literal["auto", "default", "flex", "scale", "priority"] | None
@@ -180,7 +179,6 @@ class OpenAISession(SessionABC):
     def __init__(
         self,
         execution_dir: Path,
-        working_dir: Path,
         *,
         fork_session: OpenAISession | None = None,
         instructions: str | None = None,
@@ -197,7 +195,6 @@ class OpenAISession(SessionABC):
         writable_roots: list[Path | str] | None = None,
     ):
         self.execution_dir = execution_dir
-        self.working_dir = working_dir
         self.fork_session = fork_session
         self.instructions = instructions
         self.service_tier = service_tier
@@ -253,7 +250,7 @@ class OpenAISession(SessionABC):
 
         for command in commands:
             try:
-                writable_roots = [self.working_dir] + [Path(root) for root in self.writable_roots]
+                writable_roots = [Path(root) for root in self.writable_roots]
                 stdout, stderr, returncode = await run_under_seatbelt(command, self.network_access, writable_roots, timeout, self.execution_dir)
 
                 output.append(ResponseFunctionShellCallOutputContentParam(
