@@ -183,6 +183,8 @@ class ClaudeSession(SessionABC):
                 if self.fork_session._session_id is None:
                     raise RuntimeError("Forking from ClaudeSession without assigned session id")
                 fork_session_id = self.fork_session._session_id
+        else:
+            fork_session_id = None
 
         options = ClaudeAgentOptions(
             system_prompt=self.system_prompt,
