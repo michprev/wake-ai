@@ -168,8 +168,7 @@ class ClaudeSession(SessionABC):
                 )
                 formatter.print_system_message(status)
             else:
-                breakpoint()
-            pass
+                logger.warning(f"Unexpected Claude system message subtype: {message.subtype}")
         elif isinstance(message, ResultMessage):
             pass
         else:
