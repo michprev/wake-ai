@@ -8,7 +8,7 @@ import random
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import AsyncIterator, Awaitable, NamedTuple, Literal, Any, Callable
+from typing import AsyncIterator, Awaitable, NamedTuple, Literal, Any, Callable, cast
 
 import httpx
 from mcp import ClientSession, StdioServerParameters
@@ -17,9 +17,10 @@ from mcp.client.sse import sse_client
 from mcp.client.streamable_http import streamablehttp_client
 from mcp.types import TextContent
 from openai import APIError, AsyncOpenAI, omit
-from openai.types.responses import FunctionToolParam, ResponseAudioDeltaEvent, ResponseCompletedEvent, ResponseCreatedEvent, ResponseFunctionCallArgumentsDeltaEvent, ResponseFunctionCallArgumentsDoneEvent, ResponseFunctionShellCallOutputContentParam, ResponseFunctionShellToolCall, ResponseFunctionToolCall, ResponseInProgressEvent, ResponseOutputItemAddedEvent, ResponseOutputItemDoneEvent, ResponseOutputMessage, ResponseOutputRefusal, ResponseOutputText, ResponseReasoningItem, ResponseTextConfigParam, ResponseTextDeltaEvent, ResponseTextDoneEvent, ToolParam
+from openai.types.responses import EasyInputMessageParam, FunctionToolParam, ResponseAudioDeltaEvent, ResponseCompletedEvent, ResponseCreatedEvent, ResponseFunctionCallArgumentsDeltaEvent, ResponseFunctionCallArgumentsDoneEvent, ResponseFunctionShellCallOutputContentParam, ResponseFunctionShellToolCall, ResponseFunctionToolCall, ResponseInProgressEvent, ResponseOutputItemAddedEvent, ResponseOutputItemDoneEvent, ResponseOutputMessage, ResponseOutputRefusal, ResponseOutputText, ResponseReasoningItem, ResponseTextConfigParam, ResponseTextDeltaEvent, ResponseTextDoneEvent, ToolParam
 from openai.types.responses.function_shell_tool import FunctionShellTool
 from openai.types.responses.response_function_shell_call_output_content_param import OutcomeExit, OutcomeTimeout
+from openai.types.responses.response_input_item_param import ResponseInputItemParam
 from openai.types.responses.response_input_param import FunctionCallOutput, ShellCallOutput
 from openai.types.shared_params import ResponseFormatText
 from openai.types.shared_params.reasoning import Reasoning
@@ -173,7 +174,7 @@ class OpenAISession(SessionABC):
 
     client: AsyncOpenAI
     _session_id: str | None
-    last_message_id: str | None
+    conversation: list[ResponseInputItemParam]
     total_token_usage: OpenAITotalTokenUsage
 
     def __init__(
@@ -217,11 +218,11 @@ class OpenAISession(SessionABC):
             api_key=os.getenv("OPENAI_API_KEY"),
         )
         if fork_session is not None:
-            if fork_session.last_message_id is None:
-                raise ValueError("Forking from OpenAISession without assigned last message id")
-            self.last_message_id = fork_session.last_message_id
+            if not fork_session.conversation:
+                raise ValueError("Forking from OpenAISession with empty conversation")
+            self.conversation = fork_session.conversation.copy()
         else:
-            self.last_message_id = None
+            self.conversation = []
         self._session_id = None
         self.total_token_usage = OpenAITotalTokenUsage()
 
@@ -344,16 +345,18 @@ class OpenAISession(SessionABC):
         service_tier = self.service_tier or "standard"
         last_flex_successful = True
 
+        self.conversation.append(EasyInputMessageParam(content=prompt, role="user", type="message"))
+
         while True:
             try:
                 stream = await self.client.responses.create(
-                    input=input,
+                    input=self.conversation,
                     model=model,
                     instructions=self.instructions or omit,
                     service_tier="default" if service_tier == "standard" else service_tier,
                     tools=tools or omit,
                     stream=True,
-                    previous_response_id=self.last_message_id or omit,
+                    store=False,
                     reasoning=Reasoning(
                         effort=self.reasoning_effort,
                         summary=self.reasoning_summary,
@@ -373,7 +376,7 @@ class OpenAISession(SessionABC):
 
                 async for event in stream:
                     if isinstance(event, ResponseCreatedEvent):
-                        self.last_message_id = event.response.id
+                        pass
                     elif isinstance(event, ResponseInProgressEvent):
                         pass
                     elif isinstance(event, ResponseTextDeltaEvent):
@@ -473,12 +476,20 @@ class OpenAISession(SessionABC):
 
             assert response is not None
 
+            # Persist assistant outputs (messages, tool calls, reasoning, ...)
+            # so future requests can include complete conversation history.
+            self.conversation.extend(
+                cast(
+                    list[ResponseInputItemParam],
+                    [item.model_dump(mode="json", exclude_none=True) for item in response.output],
+                )
+            )
+
             yield self.total_token_usage.total_cost
 
             if not tool_calls and not shell_calls:
                 break
 
-            input = []
             shell_tasks = [task for task, _ in shell_calls.values()]
             await asyncio.gather(*tool_calls.values(), *shell_tasks, return_exceptions=True)
 
@@ -488,7 +499,7 @@ class OpenAISession(SessionABC):
                 else:
                     formatter.print_tool_result(task.result(), False)
 
-                input.append(FunctionCallOutput(
+                self.conversation.append(FunctionCallOutput(
                     call_id=call_id,
                     output=json.dumps(str(task.exception()) if task.exception() else task.result()),
                     type="function_call_output",
@@ -506,7 +517,7 @@ class OpenAISession(SessionABC):
                     else:
                         assert False, f"Unexpected outcome: {output['outcome']}"
 
-                input.append(ShellCallOutput(
+                self.conversation.append(ShellCallOutput(
                     call_id=call_id,
                     output=task.result(),
                     type="shell_call_output",
@@ -563,5 +574,5 @@ class OpenAISession(SessionABC):
         """
         Reset the session ID
         """
-        self.last_message_id = None
+        self.conversation = []
         self._session_id = None
