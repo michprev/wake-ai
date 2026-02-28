@@ -294,8 +294,6 @@ class OpenAISession(SessionABC):
             return {"isError": result.isError, "content": "\n".join(c.text for c in result.content if isinstance(c, TextContent))}
 
     async def _stream_messages(self, prompt: str, model: str, mcp_clients: dict[str, ClientSession], formatter: VerboseFormatter) -> AsyncIterator[float]:
-        input = prompt
-
         tools: list[ToolParam] = [
             FunctionToolParam(
                 name=tool.name,
@@ -368,6 +366,7 @@ class OpenAISession(SessionABC):
                         verbosity=self.output_verbosity,
                     ),
                     timeout=self.request_timeout,
+                    include=["reasoning.encrypted_content"],
                 )
 
                 response = None
