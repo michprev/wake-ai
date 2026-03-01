@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+from functools import partial
 from pathlib import Path
-from typing import AsyncIterator, NamedTuple, Literal
+from typing import AsyncIterator, NamedTuple, Literal, Callable, Awaitable, Any
 
-from claude_agent_sdk import AgentDefinition, AssistantMessage, ClaudeAgentOptions, McpServerConfig, Message, ResultMessage, SystemMessage, TextBlock, ThinkingBlock, ToolResultBlock, ToolUseBlock, UserMessage, query
+from claude_agent_sdk import AgentDefinition, AssistantMessage, ClaudeAgentOptions, McpServerConfig, Message, ResultMessage, SystemMessage, TextBlock, ThinkingBlock, ToolResultBlock, ToolUseBlock, UserMessage, query, create_sdk_mcp_server, SdkMcpTool
 from claude_agent_sdk.types import SystemPromptPreset
 
-from .session_abc import SessionABC
+from .session_abc import SessionABC, FunctionTool
 from .verbose_formatter import VerboseFormatter
 from ..utils.logging import get_logger
 
@@ -32,6 +33,7 @@ DEFAULT_ALLOWED_TOOLS = (
     "TodoWrite",
     # Wake MCP
     "mcp__wake",
+    "mcp___internal",
     # Write tools (needed for results - cannot be path-restricted)
     "Write(/{working_dir}/**)",
     "Edit(/{working_dir}/**)",
@@ -55,6 +57,14 @@ class ClaudeResponse(NamedTuple):
     status: Literal["running", "terminating_on_max_cost", "succeeded", "terminated", "errored"]
 
 
+async def wrap_prompt(text):
+    yield {"type": "user", "message": {"role": "user", "content": text}}
+
+
+async def tool_wrapper(handler: Callable[..., Awaitable[Any]], args: dict[str, Any]) -> Any:
+    return await handler(**args)
+
+
 class ClaudeSession(SessionABC):
     execution_dir: Path
     working_dir: Path
@@ -65,6 +75,8 @@ class ClaudeSession(SessionABC):
     agents: dict[str, AgentDefinition]
     system_prompt: str | SystemPromptPreset | None
     fork_session: str | ClaudeSession | None
+    tools: list[FunctionTool]
+    env: dict[str, str]
 
     def __init__(
         self,
@@ -78,6 +90,8 @@ class ClaudeSession(SessionABC):
         agents: dict[str, AgentDefinition] | None = None,
         system_prompt: str | SystemPromptPreset | None = None,
         fork_session: str | ClaudeSession | None = None,
+        tools: list[FunctionTool] | None = None,
+        env: dict[str, str] | None = None,
     ):
         if session_id is not None and fork_session is not None:
             raise ValueError("session_id and fork_session cannot be used together")
@@ -105,6 +119,16 @@ class ClaudeSession(SessionABC):
 
         self.system_prompt = system_prompt
         self.fork_session = fork_session
+
+        if tools is None:
+            self.tools = []
+        else:
+            self.tools = list(tools)
+
+        if env is None:
+            self.env = {}
+        else:
+            self.env = env
 
     @property
     def session_id(self) -> str | None:
@@ -185,6 +209,24 @@ class ClaudeSession(SessionABC):
         else:
             fork_session_id = None
 
+        if self.tools:
+            internal_mcp = create_sdk_mcp_server(
+                name="_internal",
+                version="1.0.0",
+                tools=[
+                    SdkMcpTool(
+                        name=tool.name,
+                        description=tool.description or "",
+                        input_schema=tool.input_schema,
+                        handler=partial(tool_wrapper, tool.handler),
+                    )
+                    for tool in self.tools
+                ]
+            )
+            mcps = {**self.mcp_servers, "_internal": internal_mcp}
+        else:
+            mcps = self.mcp_servers
+
         options = ClaudeAgentOptions(
             system_prompt=self.system_prompt,
             allowed_tools=self.allowed_tools,
@@ -194,10 +236,11 @@ class ClaudeSession(SessionABC):
             cwd=str(self.execution_dir),  # Set working directory for command execution
             permission_mode="default",
             max_turns=TURN_STEP,
-            mcp_servers=self.mcp_servers,
+            mcp_servers=mcps,
             agents=self.agents,
             fork_session=fork_session_id is not None,
             stderr=formatter.print_error,
+            env=self.env,
         )
 
         total_cost = 0.0
@@ -211,7 +254,7 @@ class ClaudeSession(SessionABC):
         formatter.print_user_message(prompt)
 
         # initial query
-        async for message in query(prompt=prompt, options=options):
+        async for message in query(prompt=wrap_prompt(prompt), options=options):
             self._process_message(message, formatter)
             # ResultMessage indicates the response is complete.
             if isinstance(message, ResultMessage):
@@ -231,7 +274,7 @@ class ClaudeSession(SessionABC):
             formatter.print_user_message("continue")
 
             result = None
-            async for message in query(prompt="continue", options=options):
+            async for message in query(prompt=wrap_prompt("continue"), options=options):
                 self._process_message(message, formatter)
                 # ResultMessage indicates the response is complete.
                 if isinstance(message, ResultMessage):
@@ -250,7 +293,7 @@ class ClaudeSession(SessionABC):
             formatter.print_user_message(termination_prompt)
 
             result = None
-            async for message in query(prompt=termination_prompt, options=options):
+            async for message in query(prompt=wrap_prompt(termination_prompt), options=options):
                 self._process_message(message, formatter)
                 # ResultMessage indicates the response is complete.
                 if isinstance(message, ResultMessage):

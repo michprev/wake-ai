@@ -27,7 +27,7 @@ from openai.types.shared_params.reasoning import Reasoning
 
 from .codex_pricing import GPT_PRICING
 from .seatbelt import run_under_seatbelt
-from .session_abc import SessionABC
+from .session_abc import SessionABC, FunctionTool
 from .verbose_formatter import VerboseFormatter
 from ..utils.logging import get_logger
 
@@ -37,13 +37,6 @@ logger = get_logger(__name__)
 class OpenAIResponse(NamedTuple):
     cost: float
     status: Literal["running", "terminating_on_max_cost", "succeeded", "terminated", "errored"]
-
-
-class FunctionTool(NamedTuple):
-    name: str
-    input_schema: dict[str, Any]
-    description: str | None
-    handler: Callable[..., Awaitable[Any]]
 
 
 def _compute_backoff_time(retry: int) -> float:
