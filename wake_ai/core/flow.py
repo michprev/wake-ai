@@ -522,8 +522,16 @@ class AIWorkflow(ABC):
                             step.done_event.set()
                         else:
                             if isinstance(step, WorkflowStep) and step.attempt <= step.retries:
-                                traceback = Traceback.from_exception(type(exception), exception, exception.__traceback__)
-                                self.console.print(traceback)
+                                if isinstance(exception, BaseExceptionGroup):
+                                    for i, sub in enumerate(exception.exceptions, 1):
+                                        self.console.print(f"[red]Subexception {i}:[/red] {sub!r}")
+                                        self.console.print(
+                                            Traceback.from_exception(type(sub), sub, sub.__traceback__)
+                                        )
+                                else:
+                                    self.console.print(
+                                        Traceback.from_exception(type(exception), exception, exception.__traceback__)
+                                    )
                                 self.console.print(f"Exception happened during step {step.name}, retrying...")
 
                                 assert step.start_time is not None
