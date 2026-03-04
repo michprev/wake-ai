@@ -62,7 +62,14 @@ async def wrap_prompt(text):
 
 
 async def tool_wrapper(handler: Callable[..., Awaitable[Any]], args: dict[str, Any]) -> Any:
-    return await handler(**args)
+    return {
+        "content": [
+            {
+                "type": "text",
+                "text": str(await handler(**args))
+            }
+        ]
+    }
 
 
 class ClaudeSession(SessionABC):
