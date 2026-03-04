@@ -241,6 +241,7 @@ class ClaudeSession(SessionABC):
             fork_session=fork_session_id is not None,
             stderr=formatter.print_error,
             env=self.env,
+            max_buffer_size=10 * 1024 * 1024 * 1024,  # 10GB
         )
 
         total_cost = 0.0
