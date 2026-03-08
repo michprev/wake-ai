@@ -17,7 +17,7 @@ from mcp.client.sse import sse_client
 from mcp.client.streamable_http import streamablehttp_client
 from mcp.types import TextContent
 from openai import APIError, AsyncOpenAI, omit
-from openai.types.responses import EasyInputMessageParam, FunctionToolParam, ResponseAudioDeltaEvent, ResponseCompletedEvent, ResponseCreatedEvent, ResponseFunctionCallArgumentsDeltaEvent, ResponseFunctionCallArgumentsDoneEvent, ResponseFunctionShellCallOutputContentParam, ResponseFunctionShellToolCall, ResponseFunctionToolCall, ResponseInProgressEvent, ResponseOutputItemAddedEvent, ResponseOutputItemDoneEvent, ResponseOutputMessage, ResponseOutputRefusal, ResponseOutputText, ResponseReasoningItem, ResponseTextConfigParam, ResponseTextDeltaEvent, ResponseTextDoneEvent, ToolParam
+from openai.types.responses import EasyInputMessageParam, FunctionToolParam, ResponseIncompleteEvent, ResponseAudioDeltaEvent, ResponseCompletedEvent, ResponseCreatedEvent, ResponseFunctionCallArgumentsDeltaEvent, ResponseFunctionCallArgumentsDoneEvent, ResponseFunctionShellCallOutputContentParam, ResponseFunctionShellToolCall, ResponseFunctionToolCall, ResponseInProgressEvent, ResponseOutputItemAddedEvent, ResponseOutputItemDoneEvent, ResponseOutputMessage, ResponseOutputRefusal, ResponseOutputText, ResponseReasoningItem, ResponseTextConfigParam, ResponseTextDeltaEvent, ResponseTextDoneEvent, ToolParam
 from openai.types.responses.function_shell_tool import FunctionShellTool
 from openai.types.responses.response_function_shell_call_output_content_param import OutcomeExit, OutcomeTimeout
 from openai.types.responses.response_input_item_param import ResponseInputItemParam
@@ -68,6 +68,8 @@ LEGACY_SHELL_INPUT_SCHEMA = {
     },
     "required": ["commands", "timeout_ms"],
 }
+
+MAX_COMPACTIONS = 5
 
 
 class OpenAITokenUsage:
@@ -147,6 +149,16 @@ class StreamableHTTPServerParameters:
     timeout: float = 5
     sse_read_timeout: float = 60 * 5
     terminate_on_close: bool = False
+
+
+class ResponseIncompleteError(Exception):
+    reason: str | None
+
+    def __init__(self, reason: str | None) -> None:
+        self.reason = reason
+
+    def __str__(self) -> str:
+        return f"Response incomplete: {self.reason}"
 
 
 class OpenAISession(SessionABC):
@@ -335,11 +347,41 @@ class OpenAISession(SessionABC):
         retry = 0
         service_tier = self.service_tier or "standard"
         last_flex_successful = True
+        compact_reason: str | None = None
+        compact_count = 0
 
         self.conversation.append(EasyInputMessageParam(content=prompt, role="user", type="message"))
 
         while True:
             try:
+                if compact_reason is not None:
+                    compact_count += 1
+                    if compact_count > MAX_COMPACTIONS:
+                        raise RuntimeError("max_compactions_reached")
+
+                    formatter.print_system_message(f"Compacting conversation ({compact_count}/{MAX_COMPACTIONS})")
+
+                    compacted = await self.client.responses.compact(
+                        model=model,
+                        input=self.conversation,
+                        instructions=self.instructions or omit,
+                        timeout=self.request_timeout,
+                    )
+                    self.total_token_usage.update(
+                        input_tokens_total=compacted.usage.input_tokens,
+                        input_tokens_cached=compacted.usage.input_tokens_details.cached_tokens,
+                        output_tokens=compacted.usage.output_tokens,
+                        model=model,
+                        tier="standard",
+                    )
+                    self.conversation = cast(
+                        list[ResponseInputItemParam],
+                        [item.model_dump(mode="json", exclude_none=True) for item in compacted.output],
+                    )
+                    if compact_reason == "max_output_tokens":
+                        self.conversation.append(EasyInputMessageParam(content="continue", role="user", type="message"))
+                    compact_reason = None
+
                 stream = await self.client.responses.create(
                     input=self.conversation,
                     model=model,
@@ -362,11 +404,12 @@ class OpenAISession(SessionABC):
                     include=["reasoning.encrypted_content"],
                 )
 
-                response = None
+                last_event = None
                 tool_calls: dict[str, asyncio.Task[Any]] = {}
                 shell_calls: dict[str, tuple[asyncio.Task[list[ResponseFunctionShellCallOutputContentParam]], ResponseFunctionShellToolCall]] = {}
 
                 async for event in stream:
+                    last_event = event
                     if isinstance(event, ResponseCreatedEvent):
                         pass
                     elif isinstance(event, ResponseInProgressEvent):
@@ -416,7 +459,7 @@ class OpenAISession(SessionABC):
                         else:
                             assert False, f"Unexpected item type: {type(event.item)}"
 
-                    elif isinstance(event, ResponseCompletedEvent):
+                    elif isinstance(event, (ResponseCompletedEvent, ResponseIncompleteEvent)):
                         response = event.response
                         if response.usage is not None:
                             self.total_token_usage.update(
@@ -426,6 +469,13 @@ class OpenAISession(SessionABC):
                                 model=model,
                                 tier=service_tier,
                             )
+
+                        if response.incomplete_details is not None:
+                            if response.incomplete_details.reason != "max_output_tokens":
+                                raise ResponseIncompleteError(response.incomplete_details.reason)
+                            else:
+                                logger.warning(f"Output tokens exceeded, compacting conversation")
+                                compact_reason = "max_output_tokens"
                     elif isinstance(event, ResponseFunctionCallArgumentsDoneEvent):
                         pass
                     elif isinstance(event, ResponseFunctionCallArgumentsDeltaEvent):
@@ -434,10 +484,15 @@ class OpenAISession(SessionABC):
                         pass
                     else:
                         pass
-            except (APIError, httpx.RemoteProtocolError, httpx.TimeoutException) as e:
+            except (APIError, httpx.RemoteProtocolError, httpx.TimeoutException, ResponseIncompleteError) as e:
+                if isinstance(e, APIError) and e.code == "context_length_exceeded":
+                    logger.warning(f"Context length exceeded, compacting conversation")
+                    compact_reason = "context_length_exceeded"
+                    continue
+
                 formatter.print_error(f"Request failed with tier {service_tier}: {e}")
 
-                if service_tier == "flex":
+                if service_tier == "flex" and compact_reason is None:
                     if last_flex_successful:
                         max_retries = self.max_retries
                     else:
@@ -451,7 +506,7 @@ class OpenAISession(SessionABC):
                     retry += 1
                     continue
                 else:
-                    if service_tier == "flex":
+                    if service_tier == "flex" and compact_reason is None:
                         # reset retries, set flag & switch to standard
                         last_flex_successful = False
                         retry = 0
@@ -466,7 +521,9 @@ class OpenAISession(SessionABC):
             if self.service_tier == "flex":
                 service_tier = "flex"
 
-            assert response is not None
+            yield self.total_token_usage.total_cost
+
+            assert response is not None, f"Expected response, got last event: {last_event}"
 
             # Persist assistant outputs (messages, tool calls, reasoning, ...)
             # so future requests can include complete conversation history.
@@ -477,9 +534,7 @@ class OpenAISession(SessionABC):
                 )
             )
 
-            yield self.total_token_usage.total_cost
-
-            if not tool_calls and not shell_calls:
+            if not tool_calls and not shell_calls and compact_reason is None:
                 break
 
             shell_tasks = [task for task, _ in shell_calls.values()]
