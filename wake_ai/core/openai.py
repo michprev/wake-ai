@@ -333,7 +333,8 @@ class OpenAISession(SessionABC):
                 cursor = response.nextCursor
 
         if self.shell:
-            if not model.startswith("gpt-5.1") and not model.startswith("gpt-5.2"):
+            # TODO: workaround for bug on OpenAI's server side
+            if True:
                 tools.append(FunctionToolParam(
                     name="shell",
                     parameters=LEGACY_SHELL_INPUT_SCHEMA,
@@ -430,7 +431,8 @@ class OpenAISession(SessionABC):
                         elif isinstance(event.item, ResponseFunctionToolCall):
                             formatter.print_tool_use(event.item.name, event.item.arguments)
 
-                            if event.item.name == "shell" and not model.startswith("gpt-5.1") and not model.startswith("gpt-5.2"):
+                            # TODO: workaround for bug on OpenAI's server side
+                            if event.item.name == "shell" and True:
                                 tool_calls[event.item.call_id] = asyncio.create_task(self._call_legacy_shell(event.item.arguments))
                             elif event.item.name in mcp_tools:
                                 tool_calls[event.item.call_id] = asyncio.create_task(self._call_mcp_tool(mcp_tools[event.item.name][1], mcp_tools[event.item.name][0], event.item.arguments))
