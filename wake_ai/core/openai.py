@@ -77,23 +77,29 @@ class OpenAITokenUsage:
     input_tokens_total: int
     input_tokens_cached: int
     output_tokens: int
+    cost: float
 
     def __init__(self, input_tokens_total: int = 0, input_tokens_cached: int = 0, output_tokens: int = 0) -> None:
         self.input_tokens_total = input_tokens_total
         self.input_tokens_cached = input_tokens_cached
         self.output_tokens = output_tokens
+        self.cost = 0.0
 
-    def update(self, input_tokens_total: int, input_tokens_cached: int, output_tokens: int) -> None:
+    def update(self, model: str, tier: Literal["flex", "standard", "priority"], input_tokens_total: int, input_tokens_cached: int, output_tokens: int) -> None:
         self.input_tokens_total += input_tokens_total
         self.input_tokens_cached += input_tokens_cached
         self.output_tokens += output_tokens
 
-    def compute_cost(self, model: str, tier: Literal["flex", "standard", "priority"] = "standard") -> float:
-        return (
-            (self.input_tokens_total - self.input_tokens_cached) * GPT_PRICING[model][tier].input_mtoken_cost / 1e6
-            + self.input_tokens_cached * GPT_PRICING[model][tier].cached_input_mtoken_cost / 1e6
-            + self.output_tokens * GPT_PRICING[model][tier].output_mtoken_cost / 1e6
-        )
+        input_cost = (input_tokens_total - input_tokens_cached) * GPT_PRICING[model][tier].input_mtoken_cost / 1e6
+        cached_input_cost = input_tokens_cached * GPT_PRICING[model][tier].cached_input_mtoken_cost / 1e6
+        output_cost = output_tokens * GPT_PRICING[model][tier].output_mtoken_cost / 1e6
+
+        if model in {"gpt-5.4", "gpt-5.4-pro"} and input_tokens_total >= 272_000:
+            input_cost *= 2
+            cached_input_cost *= 2
+            output_cost *= 1.5
+
+        self.cost += input_cost + cached_input_cost + output_cost
 
 
 class OpenAITotalTokenUsage:
@@ -115,7 +121,7 @@ class OpenAITotalTokenUsage:
         total_cost = 0.0
         for model, tiered_usage in self.usage.items():
             for tier, usage in tiered_usage.items():
-                total_cost += usage.compute_cost(model, tier)
+                total_cost += usage.cost
         return total_cost
 
     def update(
@@ -132,7 +138,7 @@ class OpenAITotalTokenUsage:
                 "standard": OpenAITokenUsage(),
                 "priority": OpenAITokenUsage(),
             }
-        self.usage[model][tier].update(input_tokens_total, input_tokens_cached, output_tokens)
+        self.usage[model][tier].update(model, tier, input_tokens_total, input_tokens_cached, output_tokens)
 
 
 @dataclass
