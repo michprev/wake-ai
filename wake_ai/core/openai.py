@@ -26,6 +26,7 @@ from openai.types.shared_params import ResponseFormatText
 from openai.types.shared_params.reasoning import Reasoning
 
 from .codex_pricing import GPT_PRICING
+from .landlock import run_under_landlock
 from .seatbelt import run_under_seatbelt
 from .session_abc import SessionABC, FunctionTool
 from .verbose_formatter import VerboseFormatter
@@ -246,8 +247,8 @@ class OpenAISession(SessionABC):
         return await tool.handler(**input)
 
     async def _call_shell(self, commands: list[str], timeout_ms: int | None, max_output_length: int | None) -> list[ResponseFunctionShellCallOutputContentParam]:
-        if platform.system() != "Darwin":
-            raise NotImplementedError("Shell tools are only supported on macOS")
+        if platform.system() not in {"Darwin", "Linux"}:
+            raise NotImplementedError("Shell tools are only supported on macOS and Linux")
 
         timeout = timeout_ms / 1000.0 if timeout_ms is not None else None
         max_length = max_output_length if max_output_length is not None else 1000000
@@ -257,7 +258,10 @@ class OpenAISession(SessionABC):
         for command in commands:
             try:
                 writable_roots = [Path(root) for root in self.writable_roots]
-                stdout, stderr, returncode = await run_under_seatbelt(command, self.network_access, writable_roots, timeout, self.execution_dir)
+                if platform.system() == "Darwin":
+                    stdout, stderr, returncode = await run_under_seatbelt(command, self.network_access, writable_roots, timeout, self.execution_dir)
+                else:
+                    stdout, stderr, returncode = await run_under_landlock(command, self.network_access, writable_roots, timeout, self.execution_dir)
 
                 output.append(ResponseFunctionShellCallOutputContentParam(
                     outcome=OutcomeExit(
