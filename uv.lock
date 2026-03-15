@@ -2397,7 +2397,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "black", marker = "extra == 'dev'", specifier = ">=22.0" },
-    { name = "claude-agent-sdk", specifier = ">=0.1.44" },
+    { name = "claude-agent-sdk", specifier = ">=0.1.48" },
     { name = "click", specifier = ">=8.0" },
     { name = "eth-wake", specifier = ">=4.20.0" },
     { name = "isort", marker = "extra == 'dev'", specifier = ">=5.0" },
