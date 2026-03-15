@@ -84,6 +84,7 @@ class ClaudeSession(SessionABC):
     fork_session: str | ClaudeSession | None
     tools: list[FunctionTool]
     env: dict[str, str]
+    effort: Literal["low", "medium", "high", "max"] | None
 
     def __init__(
         self,
@@ -99,6 +100,7 @@ class ClaudeSession(SessionABC):
         fork_session: str | ClaudeSession | None = None,
         tools: list[FunctionTool] | None = None,
         env: dict[str, str] | None = None,
+        effort: Literal["low", "medium", "high", "max"] | None = None,
     ):
         if session_id is not None and fork_session is not None:
             raise ValueError("session_id and fork_session cannot be used together")
@@ -136,6 +138,8 @@ class ClaudeSession(SessionABC):
             self.env = {}
         else:
             self.env = env
+
+        self.effort = effort
 
     @property
     def session_id(self) -> str | None:
@@ -249,6 +253,7 @@ class ClaudeSession(SessionABC):
             stderr=formatter.print_error,
             env=self.env,
             max_buffer_size=10 * 1024 * 1024 * 1024,  # 10GB
+            effort=self.effort,
         )
 
         total_cost = 0.0
