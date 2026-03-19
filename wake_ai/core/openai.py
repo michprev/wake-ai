@@ -42,6 +42,15 @@ class OpenAIResponse(NamedTuple):
     status: Literal["running", "terminating_on_max_cost", "succeeded", "terminated", "errored"]
 
 
+def _normalize_mcp_schema(schema: Any) -> dict[str, Any]:
+    """Ensure MCP inputSchema includes 'properties' — required by OpenAI for object schemas."""
+    if not isinstance(schema, dict) or schema.get("type") != "object":
+        return {"type": "object", "properties": {}}
+    if "properties" not in schema:
+        return {**schema, "properties": {}}
+    return schema
+
+
 def _compute_backoff_time(retry: int) -> float:
     # base time is 20 seconds, exponential growth; 10% jitter
     # retry starts at 0
@@ -400,7 +409,7 @@ class OpenAISession(SessionABC):
                     mcp_tools[alias] = (client, tool.name)
                     tools.append(FunctionToolParam(
                         name=alias,
-                        parameters=tool.inputSchema,
+                        parameters=_normalize_mcp_schema(tool.inputSchema),
                         description=tool.description,
                         type="function",
                         strict=False,
