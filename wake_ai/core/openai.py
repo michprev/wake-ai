@@ -249,6 +249,8 @@ class OpenAISession(SessionABC):
     output_verbosity: Literal["low", "medium", "high"] | None
     max_retries: int
     request_timeout: float | None
+    tool_call_timeout: float | None
+    mcp_call_timeout: float | None
     tools: dict[str, FunctionTool]
     shell: bool
     mcps: dict[str, ClientSession | StdioServerParameters | SSEServerParameters | StreamableHTTPServerParameters]
@@ -272,6 +274,8 @@ class OpenAISession(SessionABC):
         output_verbosity: Literal["low", "medium", "high"] | None = None,
         max_retries: int = 5,
         request_timeout: float | None = 600,  # 10 minutes
+        tool_call_timeout: float | None = 300,  # 5 minutes
+        mcp_call_timeout: float | None = 300,  # 5 minutes
         tools: list[FunctionTool] | None = None,
         shell: bool = True,
         mcps: dict[str, ClientSession | StdioServerParameters | SSEServerParameters | StreamableHTTPServerParameters] | None = None,
@@ -287,6 +291,8 @@ class OpenAISession(SessionABC):
         self.output_verbosity = output_verbosity
         self.max_retries = max_retries
         self.request_timeout = request_timeout
+        self.tool_call_timeout = tool_call_timeout
+        self.mcp_call_timeout = mcp_call_timeout
         self.shell = shell
         self.mcps = mcps or {}
         self.network_access = network_access
@@ -321,7 +327,7 @@ class OpenAISession(SessionABC):
         else:
             input = {}
 
-        return await tool.handler(**input)
+        return await asyncio.wait_for(tool.handler(**input), timeout=self.tool_call_timeout)
 
     async def _call_shell(self, commands: list[str], timeout_ms: int | None, max_output_length: int | None) -> list[ResponseFunctionShellCallOutputContentParam]:
         if platform.system() not in {"Darwin", "Linux"}:
@@ -371,8 +377,7 @@ class OpenAISession(SessionABC):
     async def _call_mcp_tool(self, client: ClientSession, tool_name: str, arguments: str) -> Any:
         args = json.loads(arguments) if arguments else {}
 
-        # TODO: read timeout seconds
-        result = await client.call_tool(tool_name, args)
+        result = await asyncio.wait_for(client.call_tool(tool_name, args), timeout=self.mcp_call_timeout)
 
         if result.structuredContent is not None:
             return {"isError": result.isError, "structuredContent": result.structuredContent}
@@ -633,14 +638,18 @@ class OpenAISession(SessionABC):
             await asyncio.gather(*tool_calls.values(), *shell_tasks, return_exceptions=True)
 
             for call_id, task in tool_calls.items():
-                if task.exception() is not None:
-                    formatter.print_tool_result(str(task.exception()), True)
+                exc = task.exception()
+                if exc is not None:
+                    error_msg = "Tool call timed out" if isinstance(exc, asyncio.TimeoutError) else str(exc)
+                    formatter.print_tool_result(error_msg, True)
+                    output = json.dumps(error_msg)
                 else:
                     formatter.print_tool_result(task.result(), False)
+                    output = json.dumps(task.result())
 
                 self.conversation.append(FunctionCallOutput(
                     call_id=call_id,
-                    output=json.dumps(str(task.exception()) if task.exception() else task.result()),
+                    output=output,
                     type="function_call_output",
                 ))
 
