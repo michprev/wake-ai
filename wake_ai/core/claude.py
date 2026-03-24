@@ -85,6 +85,7 @@ class ClaudeSession(SessionABC):
     tools: list[FunctionTool]
     env: dict[str, str]
     effort: Literal["low", "medium", "high", "max"] | None
+    turn_step: int | None
 
     def __init__(
         self,
@@ -101,6 +102,7 @@ class ClaudeSession(SessionABC):
         tools: list[FunctionTool] | None = None,
         env: dict[str, str] | None = None,
         effort: Literal["low", "medium", "high", "max"] | None = None,
+        turn_step: int | None = TURN_STEP,
     ):
         if session_id is not None and fork_session is not None:
             raise ValueError("session_id and fork_session cannot be used together")
@@ -140,6 +142,7 @@ class ClaudeSession(SessionABC):
             self.env = env
 
         self.effort = effort
+        self.turn_step = turn_step
 
     @property
     def session_id(self) -> str | None:
@@ -246,7 +249,7 @@ class ClaudeSession(SessionABC):
             model=model,
             cwd=str(self.execution_dir),  # Set working directory for command execution
             permission_mode="default",
-            max_turns=TURN_STEP,
+            max_turns=self.turn_step,
             mcp_servers=mcps,
             agents=self.agents,
             fork_session=fork_session_id is not None,
