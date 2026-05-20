@@ -9,6 +9,7 @@ import random
 import re
 import uuid
 from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
 from typing import AsyncIterator, NamedTuple, Literal, Any, cast
 
@@ -19,9 +20,10 @@ from mcp.client.sse import sse_client
 from mcp.client.streamable_http import streamablehttp_client
 from mcp.types import TextContent
 from openai import APIError, AsyncOpenAI, omit
-from openai.types.responses import EasyInputMessageParam, FunctionToolParam, ResponseIncompleteEvent, ResponseAudioDeltaEvent, ResponseCompletedEvent, ResponseCreatedEvent, ResponseFunctionCallArgumentsDeltaEvent, ResponseFunctionCallArgumentsDoneEvent, ResponseFunctionShellCallOutputContentParam, ResponseFunctionShellToolCall, ResponseFunctionToolCall, ResponseInProgressEvent, ResponseOutputItemAddedEvent, ResponseOutputItemDoneEvent, ResponseOutputMessage, ResponseOutputRefusal, ResponseOutputText, ResponseReasoningItem, ResponseTextConfigParam, ResponseTextDeltaEvent, ResponseTextDoneEvent, ToolParam
+from openai.types.responses import EasyInputMessageParam, FunctionToolParam, ResponseIncompleteEvent, ResponseAudioDeltaEvent, ResponseCompletedEvent, ResponseCreatedEvent, ResponseFunctionCallArgumentsDeltaEvent, ResponseFunctionCallArgumentsDoneEvent, ResponseFunctionShellCallOutputContentParam, ResponseFunctionShellToolCall, ResponseFunctionToolCall, ResponseInProgressEvent, ResponseOutputItemAddedEvent, ResponseOutputItemDoneEvent, ResponseOutputMessage, ResponseOutputRefusal, ResponseOutputText, ResponseReasoningItem, ResponseTextConfigParam, ResponseTextDeltaEvent, ResponseTextDoneEvent, ToolParam, WebSearchToolParam
 from openai.types.responses.function_shell_tool import FunctionShellTool
 from openai.types.responses.response_function_shell_call_output_content_param import OutcomeExit, OutcomeTimeout
+from openai.types.responses.response_function_web_search import ResponseFunctionWebSearch
 from openai.types.responses.response_input_item_param import ResponseInputItemParam
 from openai.types.responses.response_input_param import FunctionCallOutput, ShellCallOutput
 from openai.types.shared_params import ResponseFormatText
@@ -85,7 +87,7 @@ MAX_COMPACTIONS = 5
 
 # Models that support OpenAI's native shell tool (FunctionShellTool).
 # All others fall back to the legacy "shell" function workaround.
-_NATIVE_SHELL_MODEL_PREFIXES = ("gpt-5.1", "gpt-5.2", "gpt-5.4")
+_NATIVE_SHELL_MODEL_PREFIXES = ("gpt-5.1", "gpt-5.2", "gpt-5.4", "gpt-5.5")
 
 # OpenAI limits function names to 64 characters ([A-Za-z0-9_-] only).
 _OPENAI_MAX_TOOL_NAME_LEN = 64
@@ -253,8 +255,10 @@ class OpenAISession(SessionABC):
     mcp_call_timeout: float | None
     tools: dict[str, FunctionTool]
     shell: bool
+    web_search: bool
+    web_search_context_size: Literal["low", "medium", "high"] | None
     mcps: dict[str, ClientSession | StdioServerParameters | SSEServerParameters | StreamableHTTPServerParameters]
-    network_access: bool
+    shell_network_access: bool
     writable_roots: list[Path | str]
 
     client: AsyncOpenAI
@@ -273,13 +277,15 @@ class OpenAISession(SessionABC):
         reasoning_summary: Literal["auto", "concise", "detailed"] | None = None,
         output_verbosity: Literal["low", "medium", "high"] | None = None,
         max_retries: int = 5,
-        request_timeout: float | None = 600,  # 10 minutes
+        request_timeout: float | None = 1200,  # 20 minutes
         tool_call_timeout: float | None = 300,  # 5 minutes
         mcp_call_timeout: float | None = 300,  # 5 minutes
         tools: list[FunctionTool] | None = None,
         shell: bool = True,
+        web_search: bool = False,
+        web_search_context_size: Literal["low", "medium", "high"] | None = None,
         mcps: dict[str, ClientSession | StdioServerParameters | SSEServerParameters | StreamableHTTPServerParameters] | None = None,
-        network_access: bool = False,
+        shell_network_access: bool = False,
         writable_roots: list[Path | str] | None = None,
     ):
         self.execution_dir = execution_dir
@@ -294,8 +300,10 @@ class OpenAISession(SessionABC):
         self.tool_call_timeout = tool_call_timeout
         self.mcp_call_timeout = mcp_call_timeout
         self.shell = shell
+        self.web_search = web_search
+        self.web_search_context_size = web_search_context_size
         self.mcps = mcps or {}
-        self.network_access = network_access
+        self.shell_network_access = shell_network_access
         self.writable_roots = writable_roots or []
 
         self.tools = {}
@@ -305,6 +313,7 @@ class OpenAISession(SessionABC):
 
         self.client = AsyncOpenAI(
             api_key=os.getenv("OPENAI_API_KEY"),
+            timeout=self.request_timeout,
         )
         if fork_session is not None:
             if not fork_session.conversation:
@@ -333,7 +342,7 @@ class OpenAISession(SessionABC):
         if platform.system() not in {"Darwin", "Linux"}:
             raise NotImplementedError("Shell tools are only supported on macOS and Linux")
 
-        timeout = timeout_ms / 1000.0 if timeout_ms is not None else None
+        timeout = timeout_ms / 1000.0 if timeout_ms is not None else 10 * 60 * 1000
         max_length = max_output_length if max_output_length is not None else 1000000
 
         output: list[ResponseFunctionShellCallOutputContentParam] = []
@@ -342,9 +351,9 @@ class OpenAISession(SessionABC):
             try:
                 writable_roots = [Path(root) for root in self.writable_roots]
                 if platform.system() == "Darwin":
-                    stdout, stderr, returncode = await run_under_seatbelt(command, self.network_access, writable_roots, timeout, self.execution_dir)
+                    stdout, stderr, returncode = await run_under_seatbelt(command, self.shell_network_access, writable_roots, timeout, self.execution_dir)
                 else:
-                    stdout, stderr, returncode = await run_under_landlock(command, self.network_access, writable_roots, timeout, self.execution_dir)
+                    stdout, stderr, returncode = await run_under_landlock(command, self.shell_network_access, writable_roots, timeout, self.execution_dir)
 
                 output.append(ResponseFunctionShellCallOutputContentParam(
                     outcome=OutcomeExit(
@@ -424,9 +433,7 @@ class OpenAISession(SessionABC):
                 cursor = response.nextCursor
 
         if self.shell:
-            # TODO: workaround for bug on OpenAI's server side
-            if True:
-            # if not _use_native_shell:
+            if not _use_native_shell:
                 tools.append(FunctionToolParam(
                     name="shell",
                     parameters=LEGACY_SHELL_INPUT_SCHEMA,
@@ -436,6 +443,14 @@ class OpenAISession(SessionABC):
                 ))
             else:
                 tools.append(FunctionShellTool(type="shell"))
+
+        if self.web_search:
+            tool = WebSearchToolParam(
+                type="web_search",
+            )
+            if self.web_search_context_size is not None:
+                tool["search_context_size"] = self.web_search_context_size
+            tools.append(tool)
 
         retry = 0
         service_tier = self.service_tier or "standard"
@@ -552,6 +567,9 @@ class OpenAISession(SessionABC):
                                 ),
                                 event.item,
                             )
+                        elif isinstance(event.item, ResponseFunctionWebSearch):
+                            if event.item.action is not None:
+                                formatter.print_tool_use("web_search", event.item.action.to_dict())
                         else:
                             assert False, f"Unexpected item type: {type(event.item)}"
 
@@ -689,18 +707,23 @@ class OpenAISession(SessionABC):
                 else:
                     if isinstance(info, StdioServerParameters):
                         handle = stdio_client(info)
+                        read, write = await handle.__aenter__()
                     elif isinstance(info, SSEServerParameters):
                         handle = sse_client(info.url, info.headers, info.timeout, info.sse_read_timeout)
+                        read, write = await handle.__aenter__()
                     elif isinstance(info, StreamableHTTPServerParameters):
-                        handle = streamablehttp_client(info.url, info.headers, info.timeout, info.sse_read_timeout, info.terminate_on_close)
+                        handle = streamablehttp_client(info.url, info.headers, 60, 60, False)
+                        read, write, _ = await handle.__aenter__()
                     else:
                         raise ValueError(f"Unknown MCP server type: {type(info)}")
 
-                    read, write = await handle.__aenter__()
                     opened_clients.append(handle)
 
-                    # TODO: read timeout seconds
-                    client = ClientSession(read, write)
+                    client = ClientSession(
+                        read,
+                        write,
+                        read_timeout_seconds=timedelta(seconds=self.request_timeout) if self.request_timeout is not None else None,
+                    )
                     opened_clients.append(client)
 
                     session = await client.__aenter__()

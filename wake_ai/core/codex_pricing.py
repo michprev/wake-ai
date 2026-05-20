@@ -9,6 +9,23 @@ class CodexTokenPricing(NamedTuple):
 
 
 GPT_PRICING = {
+    "gpt-5.5": {
+        "flex": CodexTokenPricing(
+            input_mtoken_cost=2.50,
+            cached_input_mtoken_cost=0.25,
+            output_mtoken_cost=15.00,
+        ),
+        "standard": CodexTokenPricing(
+            input_mtoken_cost=5.00,
+            cached_input_mtoken_cost=0.50,
+            output_mtoken_cost=30.00,
+        ),
+        "priority": CodexTokenPricing(
+            input_mtoken_cost=12.50,
+            cached_input_mtoken_cost=1.25,
+            output_mtoken_cost=75.00,
+        ),
+    },
     # GPT-5.4 series
     "gpt-5.4": {
         "flex": CodexTokenPricing(
