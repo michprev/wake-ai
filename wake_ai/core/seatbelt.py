@@ -31,7 +31,13 @@ async def run_under_seatbelt(command: str, network_access: bool, writable_roots:
 
     policy = f"{BASE_POLICY}\n{RO_POLICY}\n{write_policy}\n{network_policy}"
 
-    args = ["-p", policy, "--", "bash", "-lc", command]
+    params: list[str] = []
+    if network_access:
+        # _CS_DARWIN_USER_CACHE_DIR — not in os.confstr_names, pass the raw int
+        cache_dir = os.confstr(65538)
+        params += ["-D", f"DARWIN_USER_CACHE_DIR={cache_dir}"]
+
+    args = ["-p", policy, *params, "--", "bash", "-lc", command]
 
     proc = await asyncio.create_subprocess_exec(
         "/usr/bin/sandbox-exec",
