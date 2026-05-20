@@ -4,7 +4,7 @@ from functools import partial
 from pathlib import Path
 from typing import AsyncIterator, NamedTuple, Literal, Callable, Awaitable, Any
 
-from claude_agent_sdk import AgentDefinition, AssistantMessage, ClaudeAgentOptions, McpServerConfig, Message, ResultMessage, SystemMessage, TextBlock, ThinkingBlock, ToolResultBlock, ToolUseBlock, UserMessage, query, create_sdk_mcp_server, SdkMcpTool
+from claude_agent_sdk import AgentDefinition, AssistantMessage, ClaudeAgentOptions, McpServerConfig, Message, ResultMessage, SandboxIgnoreViolations, SandboxNetworkConfig, SandboxSettings, SystemMessage, TaskNotificationMessage, TaskProgressMessage, TaskStartedMessage, TextBlock, ThinkingBlock, ToolResultBlock, ToolUseBlock, UserMessage, query, create_sdk_mcp_server, SdkMcpTool
 from claude_agent_sdk.types import SystemPromptPreset
 
 from .session_abc import SessionABC, FunctionTool
@@ -31,8 +31,12 @@ DEFAULT_ALLOWED_TOOLS = (
     "LS",
     "Task",
     "TodoWrite",
+    "LSP",
+    "Agent",
+    "ListMcpResourcesTool",
     # Wake MCP
     "mcp__wake",
+    "mcp__rust-analysis",
     "mcp___internal",
     # Write tools (needed for results - cannot be path-restricted)
     "Write(/{working_dir}/**)",
@@ -86,6 +90,8 @@ class ClaudeSession(SessionABC):
     env: dict[str, str]
     effort: Literal["low", "medium", "high", "max"] | None
     turn_step: int | None
+    shell_network_access: bool
+    ignore_skills: bool
 
     def __init__(
         self,
@@ -103,6 +109,8 @@ class ClaudeSession(SessionABC):
         env: dict[str, str] | None = None,
         effort: Literal["low", "medium", "high", "max"] | None = None,
         turn_step: int | None = TURN_STEP,
+        shell_network_access: bool = False,
+        ignore_skills: bool = True,
     ):
         if session_id is not None and fork_session is not None:
             raise ValueError("session_id and fork_session cannot be used together")
@@ -141,8 +149,12 @@ class ClaudeSession(SessionABC):
         else:
             self.env = env
 
+        self.env["CLAUDECODE"] = ""
+
         self.effort = effort
         self.turn_step = turn_step
+        self.shell_network_access = shell_network_access
+        self.ignore_skills = ignore_skills
 
     @property
     def session_id(self) -> str | None:
@@ -205,6 +217,12 @@ class ClaudeSession(SessionABC):
                     f"Session: {message.data.get('session_id', 'N/A')}"
                 )
                 formatter.print_system_message(status)
+            elif isinstance(message, TaskStartedMessage):
+                formatter.print_system_message(f"Task started: {message.description}")
+            elif isinstance(message, TaskProgressMessage):
+                formatter.print_system_message(f"Task progress: {message.description}")
+            elif isinstance(message, TaskNotificationMessage):
+                formatter.print_system_message(f"Task {message.status}: {message.summary}")
             else:
                 logger.warning(f"Unexpected Claude system message subtype: {message.subtype}")
         elif isinstance(message, ResultMessage):
@@ -242,6 +260,7 @@ class ClaudeSession(SessionABC):
             mcps = self.mcp_servers
 
         options = ClaudeAgentOptions(
+            add_dirs=[Path.home() / ".config/wake", Path.home() / ".cache/wake/explorers"],
             system_prompt=self.system_prompt,
             allowed_tools=self.allowed_tools,
             disallowed_tools=self.disallowed_tools,
@@ -257,6 +276,22 @@ class ClaudeSession(SessionABC):
             env=self.env,
             max_buffer_size=10 * 1024 * 1024 * 1024,  # 10GB
             effort=self.effort,
+            sandbox=SandboxSettings(
+                enabled=True,
+                autoAllowBashIfSandboxed=True,
+                excludedCommands=[],
+                allowUnsandboxedCommands=False,
+                network=SandboxNetworkConfig(
+                    allowAllUnixSockets=self.shell_network_access,
+                    allowLocalBinding=self.shell_network_access,
+                    allowedDomains=["*"],
+                ),
+                ignoreViolations=SandboxIgnoreViolations(
+                    file=[self.working_dir.resolve().as_posix()],
+                ),
+                enableWeakerNestedSandbox=False,
+            ),
+            skills=[] if self.ignore_skills else None,
         )
 
         total_cost = 0.0
