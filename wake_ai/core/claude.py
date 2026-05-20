@@ -14,7 +14,6 @@ from ..utils.logging import get_logger
 
 logger = get_logger(__name__)
 
-TURN_STEP = 25
 MAX_TERMINATION_ATTEMPTS = 3
 
 TERMINATION_PROMPT = (
@@ -108,7 +107,7 @@ class ClaudeSession(SessionABC):
         tools: list[FunctionTool] | None = None,
         env: dict[str, str] | None = None,
         effort: Literal["low", "medium", "high", "max"] | None = None,
-        turn_step: int | None = TURN_STEP,
+        turn_step: int | None = None,
         shell_network_access: bool = False,
         ignore_skills: bool = True,
     ):
