@@ -149,6 +149,7 @@ class ClaudeSession(SessionABC):
             self.env = env
 
         self.env["CLAUDECODE"] = ""
+        self.env["CLAUDE_CODE_EXTRA_BODY"] = "{\"thinking\":{\"type\":\"adaptive\",\"display\":\"summarized\"}}"
 
         self.effort = effort
         self.turn_step = turn_step
