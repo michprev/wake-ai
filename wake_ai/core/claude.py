@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import tempfile
 from functools import partial
 from pathlib import Path
 from typing import AsyncIterator, NamedTuple, Literal, Callable, Awaitable, Any
@@ -286,7 +288,11 @@ class ClaudeSession(SessionABC):
                     allowedDomains=["*"],
                 ),
                 ignoreViolations=SandboxIgnoreViolations(
-                    file=[self.working_dir.resolve().as_posix()],
+                    file=[
+                        self.working_dir.resolve().as_posix(),
+                        Path(os.environ.get("TMPDIR") or tempfile.gettempdir()).resolve().as_posix(),
+                        "/private/tmp",
+                    ],
                 ),
                 enableWeakerNestedSandbox=False,
             ),
