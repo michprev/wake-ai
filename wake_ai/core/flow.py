@@ -3,13 +3,15 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 import asyncio
 from contextlib import nullcontext
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime
 from functools import wraps
 from io import StringIO
 from pathlib import Path
+import re
 import shutil
-from typing import Any, Awaitable, Literal, Callable, NamedTuple, Coroutine, TypeVar, Generic, cast
+from typing import Any, Awaitable, Literal, Callable, Coroutine, TypeVar, Generic, cast
 
 import jinja2
 import jinja2.meta
@@ -27,6 +29,70 @@ from .session_abc import SessionABC
 from .verbose_formatter import VerboseFormatter
 from ..results import AIResult
 from ..utils.logging import get_verbosity_level
+
+
+# Portable, filesystem-safe subagent name. Excludes path separators (`/`, `\`),
+# Windows-reserved chars (`<>:"|?*`), whitespace, and leading dot. Allowed
+# characters: ASCII letters, digits, `_`, `-`, `.`. Length 1..64.
+# Use externally with pydantic as e.g.:
+#   SubagentName = Annotated[str, StringConstraints(pattern=SUBAGENT_NAME_PATTERN,
+#                                                    min_length=1, max_length=64)]
+SUBAGENT_NAME_PATTERN = r"^[A-Za-z0-9_-][A-Za-z0-9._-]*$"
+SUBAGENT_NAME_MAX_LENGTH = 64
+_SUBAGENT_NAME_RE = re.compile(SUBAGENT_NAME_PATTERN)
+
+
+def _validate_subagent_name(name: str) -> None:
+    if not isinstance(name, str):
+        raise TypeError(f"Subagent name must be a string, got {type(name).__name__}")
+    if not name:
+        raise ValueError("Subagent name cannot be empty")
+    if len(name) > SUBAGENT_NAME_MAX_LENGTH:
+        raise ValueError(
+            f"Subagent name '{name}' exceeds {SUBAGENT_NAME_MAX_LENGTH} characters"
+        )
+    if not _SUBAGENT_NAME_RE.match(name):
+        raise ValueError(
+            f"Subagent name '{name}' is invalid; must match {SUBAGENT_NAME_PATTERN} "
+            f"(ASCII letters/digits/_-., no leading dot, no path separators or "
+            f"reserved chars, no whitespace)"
+        )
+
+
+# Per-task slot holding the WorkflowStep whose session is currently executing.
+# Set by AIWorkflow._execute_step around `session.query(...)` so tool handlers
+# invoked from inside that query can locate the step they belong to without
+# threading it through `partial(...)` (which is impossible at step-construction
+# time since the step is being created by the same `add_step` call that takes
+# the session as input).
+#
+# ContextVars are per-asyncio-task: `asyncio.create_task` snapshots the parent's
+# context, so concurrent parallel steps each see their own value. This is the
+# only safe primitive for this pattern — `threading.local` would be wrong.
+#
+# Read via `current_host()`. Will gain `SubStep` to its type once nested
+# subagents land.
+_current_host: ContextVar[WorkflowStep | SubStep | None] = ContextVar(
+    "wake_ai_current_host", default=None
+)
+
+
+def get_current_host() -> WorkflowStep | SubStep:
+    """Return the WorkflowStep or SubStep whose session is currently executing.
+
+    Intended for tool handlers that need to invoke `host.run_subagent(...)`.
+    At top-level step execution, returns the WorkflowStep. Inside a subagent's
+    tool handler, returns the enclosing SubStep — so nested `run_subagent`
+    calls register children under the right node.
+
+    Raises RuntimeError if called outside an active step execution.
+    """
+    host = _current_host.get()
+    if host is None:
+        raise RuntimeError(
+            "current_host() called outside an active step execution"
+        )
+    return host
 
 
 def _format_duration(seconds: float) -> str:
@@ -105,11 +171,185 @@ class DynamicWorkflowStep(Generic[T]):
         return self.name == other.name
 
 
-class FailedWorkflowStep(NamedTuple):
+# Default max nesting depth for subagent trees. Configurable via
+# `AIWorkflow.max_subagent_depth` (subclass attribute or instance value).
+# Cheap insurance against accidental cycles; raise/lower as needed.
+DEFAULT_MAX_SUBAGENT_DEPTH = 4
+
+
+@dataclass
+class SubStep:
+    """
+    Tool-invoked subagent record. Identity = (parent_host, name).
+
+    SubSteps form a tree: each SubStep may itself host child SubSteps via
+    `run_subagent`. Identity lookup is local to the parent's `substeps` list,
+    so two different parents may each have a child named "helper" without
+    collision.
+
+    Stats accumulate across multiple `run_subagent` invocations of the same
+    name on the same parent (supports resumed sessions and validation
+    retries that re-trigger the same subagent).
+
+    Staleness on root-WorkflowStep retry is structural: the parent's prior
+    `substeps` list is moved into `FailedWorkflowStep.substeps`, and a fresh
+    list takes its place. SubStep itself stores no "attempt" field.
+
+    No status field: visual status mirrors the root WorkflowStep. The only
+    sub-specific state is `current_call_start`, which gates the live-ticking
+    duration and the in-call glyph.
+    """
+    name: str
+    model: str
+    depth: int  # 1 for direct children of a WorkflowStep, 2 for grandchildren, ...
+    formatter: VerboseFormatter  # own formatter; also used as parent context for children
+    # Back-ref to the host that created this SubStep. Excluded from repr/eq to
+    # avoid infinite recursion (parent.substeps contains this SubStep).
+    parent: WorkflowStep | SubStep = field(repr=False, compare=False, default=None)  # type: ignore[assignment]
+    cost: float = 0.0  # cumulative across all calls
+    accumulated_duration: float = 0.0  # cumulative seconds of completed calls
+    current_call_start: datetime | None = None  # set during an active call
+    invocation_count: int = 0
+    last_error: BaseException | None = None
+    substeps: list[SubStep] = field(default_factory=list)
+
+    @property
+    def log_file_path(self) -> Path | None:
+        return self.formatter.log_file
+
+    async def run_subagent(
+        self,
+        name: str,
+        session: SessionABC,
+        *,
+        prompt: str,
+        model: str,
+        max_cost: float | None = None,
+        formatter: VerboseFormatter | None = None,
+        max_depth: int = DEFAULT_MAX_SUBAGENT_DEPTH,
+    ) -> str:
+        """Launch a nested subagent under this SubStep. See module docs."""
+        return await _run_subagent(
+            parent=self,
+            depth=self.depth + 1,
+            max_depth=max_depth,
+            name=name,
+            session=session,
+            prompt=prompt,
+            model=model,
+            max_cost=max_cost,
+            formatter=formatter,
+        )
+
+
+@dataclass
+class FailedWorkflowStep:
     cost: float
     start_time: datetime
     end_time: datetime
     error: BaseException
+    substeps: list[SubStep] = field(default_factory=list)
+
+
+async def _run_subagent(
+    *,
+    parent: WorkflowStep | SubStep,
+    depth: int,
+    max_depth: int,
+    name: str,
+    session: SessionABC,
+    prompt: str,
+    model: str,
+    max_cost: float | None,
+    formatter: VerboseFormatter | None,
+) -> str:
+    from ..utils.logging import get_verbosity_level
+
+    _validate_subagent_name(name)
+    if depth > max_depth:
+        raise RuntimeError(
+            f"Subagent nesting depth {depth} exceeds max ({max_depth}); "
+            f"chain: {parent.formatter.step_name}_{name}"
+        )
+
+    sub = next((s for s in parent.substeps if s.name == name), None)
+    if sub is None:
+        chain = f"{parent.formatter.step_name}_{name}"
+        parent_log = parent.formatter.log_file
+        log_file = parent_log.parent / f"{chain}.log" if parent_log is not None else None
+        sub_formatter = formatter or VerboseFormatter(
+            parent.formatter.console,
+            chain,
+            log_file,
+            get_verbosity_level(),
+            reset_log_file=True,  # first ever call → reset (rotates, doesn't delete)
+        )
+        sub = SubStep(
+            name=name,
+            model=model,
+            depth=depth,
+            formatter=sub_formatter,
+            parent=parent,
+        )
+        parent.substeps.append(sub)
+    else:
+        # Concurrency guard, scoped to (parent_host, name). Different parents
+        # with same-named children don't collide (separate substeps lists).
+        if sub.current_call_start is not None:
+            raise RuntimeError(
+                f"Subagent '{name}' is already running under "
+                f"'{parent.formatter.step_name}'"
+            )
+        if formatter is not None:
+            sub.formatter = formatter
+
+    starting_cost = sub.cost
+    sub.invocation_count += 1
+    sub.current_call_start = datetime.now()
+
+    # Re-set the host ContextVar so any deeper tool handler sees THIS sub as
+    # its host (enables grandchild subagents). Per-task scoping means parallel
+    # branches stay isolated.
+    host_token = _current_host.set(sub)
+    last_info = None
+    try:
+        async for info in session.query(prompt, model, max_cost, sub.formatter):
+            # info.cost is the running total for THIS query call only
+            sub.cost = starting_cost + info.cost
+            last_info = info
+    except BaseException as e:
+        sub.last_error = e
+        raise
+    finally:
+        sub.accumulated_duration += (
+            datetime.now() - sub.current_call_start
+        ).total_seconds()
+        sub.current_call_start = None
+        _current_host.reset(host_token)
+
+    if last_info is None or last_info.final_message is None:
+        raise ValueError(f"No final message received from subagent '{name}'")
+    return last_info.final_message
+
+
+def _tree_cost(substeps: list[SubStep]) -> float:
+    return sum(s.cost + _tree_cost(s.substeps) for s in substeps)
+
+
+def _tree_in_call(substeps: list[SubStep]) -> bool:
+    return any(
+        s.current_call_start is not None or _tree_in_call(s.substeps)
+        for s in substeps
+    )
+
+
+def _substep_snapshot(sub: SubStep) -> tuple:
+    return (
+        sub.name,
+        sub.cost,
+        sub.current_call_start is not None,
+        tuple(_substep_snapshot(c) for c in sub.substeps),
+    )
 
 
 @dataclass
@@ -138,10 +378,52 @@ class WorkflowStep:
     status: Literal["pending", "running", "completed", "failed", "skipped"]
     attempt: int = 0  # counterpart to retries
     failed_attempts: list[FailedWorkflowStep] = field(default_factory=list)
+    substeps: list[SubStep] = field(default_factory=list)
     cost: float = 0.0
     start_time: datetime | None = None
     end_time: datetime | None = None
     error: BaseException | None = None
+
+    async def run_subagent(
+        self,
+        name: str,
+        session: SessionABC,
+        *,
+        prompt: str,
+        model: str,
+        max_cost: float | None = None,
+        formatter: VerboseFormatter | None = None,
+        max_depth: int = DEFAULT_MAX_SUBAGENT_DEPTH,
+    ) -> str:
+        """
+        Run a tool-invoked subagent on `session` and record it under this step.
+
+        Identity is (this step, name) — looked up in `self.substeps`. Repeat
+        invocations of the same name within the same attempt accumulate stats
+        onto the same SubStep (supports resumed sessions and validation
+        retries that re-trigger the subagent). On step retry, the prior
+        `substeps` list is moved into the new `FailedWorkflowStep.substeps`
+        and `self.substeps` starts fresh.
+
+        Default log file: `{working_dir}/{step.name}_{subagent.name}.log`,
+        appended on subsequent invocations.
+        """
+        return await _run_subagent(
+            parent=self,
+            depth=1,
+            max_depth=max_depth,
+            name=name,
+            session=session,
+            prompt=prompt,
+            model=model,
+            max_cost=max_cost,
+            formatter=formatter,
+        )
+
+    @property
+    def parent(self) -> None:
+        """WorkflowStep is the root of the host tree; has no parent."""
+        return None
 
     def format_prompt(self, context: dict[str, Any]) -> str:
         env = jinja2.Environment(
@@ -259,7 +541,12 @@ class AIWorkflow(ABC):
 
     @property
     def cumulative_cost(self) -> float:
-        return sum(step.cost + sum(f.cost for f in step.failed_attempts) for step in self.steps if isinstance(step, WorkflowStep))
+        return sum(
+            step.cost
+            + sum(f.cost + _tree_cost(f.substeps) for f in step.failed_attempts)
+            + _tree_cost(step.substeps)
+            for step in self.steps if isinstance(step, WorkflowStep)
+        )
 
     @require_initialized
     def add_step(
@@ -401,42 +688,49 @@ class AIWorkflow(ABC):
         if step.pre_hook is not None:
             step.pre_hook(step)
 
-        # main prompt query
-        async for info in step.session.query(
-            step.format_prompt(self.context),
-            step.model,
-            step.max_cost,
-            step.formatter,
-        ):
-            step.cost = info.cost
+        # Tag this asyncio task's context so tool handlers fired from within
+        # `step.session.query(...)` can locate the step via `current_host()`.
+        # Per-task scoping: parallel _execute_step tasks each have their own.
+        host_token = _current_host.set(step)
+        try:
+            # main prompt query
+            async for info in step.session.query(
+                step.format_prompt(self.context),
+                step.model,
+                step.max_cost,
+                step.formatter,
+            ):
+                step.cost = info.cost
 
-        total_cost = step.cost
+            total_cost = step.cost
 
-        # validation + fixing attempts
-        if step.validator is not None:
-            errors = step.validator(step)
-
-            retry_count = 0
-            while errors and retry_count < step.max_validation_retries:
-                retry_count += 1
-                prompt = "The following errors occurred, please fix them:\n-" + "\n-".join(errors)
-
-                async for info in step.session.query(
-                    prompt,
-                    step.validation_retry_model or step.model,
-                    step.max_validation_retry_cost,
-                    step.formatter,
-                ):
-                    step.cost = total_cost + info.cost
-
-                total_cost = step.cost
-
+            # validation + fixing attempts
+            if step.validator is not None:
                 errors = step.validator(step)
 
-            if errors:
-                step.status = "failed"
-                error_msg = f"Step '{step.name}' validation failed after {step.max_validation_retries} retries. Errors: {'; '.join(errors)}"
-                raise RuntimeError(error_msg)
+                retry_count = 0
+                while errors and retry_count < step.max_validation_retries:
+                    retry_count += 1
+                    prompt = "The following errors occurred, please fix them:\n-" + "\n-".join(errors)
+
+                    async for info in step.session.query(
+                        prompt,
+                        step.validation_retry_model or step.model,
+                        step.max_validation_retry_cost,
+                        step.formatter,
+                    ):
+                        step.cost = total_cost + info.cost
+
+                    total_cost = step.cost
+
+                    errors = step.validator(step)
+
+                if errors:
+                    step.status = "failed"
+                    error_msg = f"Step '{step.name}' validation failed after {step.max_validation_retries} retries. Errors: {'; '.join(errors)}"
+                    raise RuntimeError(error_msg)
+        finally:
+            _current_host.reset(host_token)
 
         if step.post_hook is not None:
             step.post_hook(step)
@@ -535,12 +829,17 @@ class AIWorkflow(ABC):
                                 self.console.print(f"Exception happened during step {step.name}, retrying...")
 
                                 assert step.start_time is not None
+                                # Move this attempt's substeps into the
+                                # failed-attempt record (structural staleness)
+                                # and start a fresh list for the next attempt.
                                 step.failed_attempts.append(FailedWorkflowStep(
                                     cost=step.cost,
                                     start_time=step.start_time,
                                     end_time=datetime.now(),
                                     error=exception,
+                                    substeps=step.substeps,
                                 ))
+                                step.substeps = []
 
                                 step.cost = 0.0
                                 step.status = "pending"
@@ -564,6 +863,65 @@ class AIWorkflow(ABC):
             if self.cleanup_working_dir and self.working_dir.exists():
                 shutil.rmtree(self.working_dir)
 
+    @classmethod
+    def _render_substep_tree(
+        cls,
+        table: Table,
+        sub: SubStep,
+        parent_status: str,
+        stale: bool,
+    ) -> None:
+        """Render a SubStep and its descendants. Status mirrors root WorkflowStep."""
+        in_call = sub.current_call_start is not None and not stale
+
+        parent_glyph = {
+            "pending": " ",
+            "running": "⟳",
+            "completed": "✓",
+            "failed": "✗",
+            "skipped": "○",
+        }.get(parent_status, " ")
+
+        if stale:
+            glyph = "✗" if parent_status == "failed" else parent_glyph
+            style = "dim"
+        elif in_call:
+            glyph = "▶"
+            style = "bright_yellow"
+        else:
+            glyph = parent_glyph
+            if parent_status == "completed":
+                style = "green"
+            elif parent_status == "failed":
+                style = "red"
+            elif parent_status == "running":
+                style = "bright_cyan"
+            elif parent_status == "skipped":
+                style = "yellow"
+            else:
+                style = "dim"
+
+        elapsed = sub.accumulated_duration
+        if in_call and sub.current_call_start is not None:
+            elapsed += (datetime.now() - sub.current_call_start).total_seconds()
+        sub_duration = _format_duration(elapsed) if elapsed > 0 else "-"
+        sub_cost = f"${sub.cost:.4f}" if sub.cost > 0 else "-"
+
+        suffix = f" ×{sub.invocation_count}" if sub.invocation_count > 1 else ""
+        indent = "  " * sub.depth
+        table.add_row(
+            f"{indent}└─ {glyph} {sub.name}{suffix}",
+            "",
+            sub.model,
+            sub_duration,
+            sub_cost,
+            style=style,
+        )
+
+        # Recurse into children
+        for child in sub.substeps:
+            cls._render_substep_tree(table, child, parent_status, stale)
+
     def _get_status_display(self) -> Panel:
         """Build the status display with table and progress."""
         table = Table(
@@ -571,9 +929,8 @@ class AIWorkflow(ABC):
             header_style="bold cyan",
             box=None,
             padding=(0, 1),
-            min_width=125,
         )
-        table.add_column("Step", no_wrap=True, width=40)
+        table.add_column("Step", no_wrap=True, width=60)
         table.add_column("Attempt", no_wrap=True, width=20)
         table.add_column("Model", no_wrap=True, width=25)
         table.add_column("Time", justify="right", width=20)
@@ -626,7 +983,7 @@ class AIWorkflow(ABC):
                 else:
                     attempt = f"{step.attempt}/{step.retries + 1}"
 
-                # print failed attempts first
+                # print failed attempts (with their substeps) first
                 for i, failed_attempt in enumerate(step.failed_attempts):
                     table.add_row(
                         f"✗ {step.name}",
@@ -636,12 +993,22 @@ class AIWorkflow(ABC):
                         f"${failed_attempt.cost:.4f}",
                         style="dim red",
                     )
+                    # substeps that belonged to this failed attempt (stale)
+                    for sub in failed_attempt.substeps:
+                        self._render_substep_tree(table, sub, parent_status="failed", stale=True)
 
             table.add_row(step_name, attempt, model, duration, cost, style=row_style)
 
+            # current-attempt substeps (status mirrors parent)
+            if isinstance(step, WorkflowStep):
+                for sub in step.substeps:
+                    self._render_substep_tree(table, sub, parent_status=step.status, stale=False)
+
         # Add total row
         total_cost = sum(
-            step.cost + sum(f.cost for f in step.failed_attempts)
+            step.cost
+            + sum(f.cost + _tree_cost(f.substeps) for f in step.failed_attempts)
+            + _tree_cost(step.substeps)
             for step in self.steps if isinstance(step, WorkflowStep)
         )
 
@@ -662,7 +1029,12 @@ class AIWorkflow(ABC):
                 step.status,
                 step.attempt if isinstance(step, WorkflowStep) else None,
                 step.cost if isinstance(step, WorkflowStep) else None,
-                tuple(f.cost for f in step.failed_attempts) if isinstance(step, WorkflowStep) else None,
+                tuple(
+                    (f.cost, tuple(_substep_snapshot(s) for s in f.substeps))
+                    for f in step.failed_attempts
+                ) if isinstance(step, WorkflowStep) else None,
+                tuple(_substep_snapshot(s) for s in step.substeps)
+                if isinstance(step, WorkflowStep) else None,
             )
             for step in self.steps
         )
@@ -676,4 +1048,4 @@ class AIWorkflow(ABC):
             self._last_status_snapshot = current_snapshot
 
         # Return panel with table and status
-        return Panel(table, title=self.status_title, border_style="blue", width=84)
+        return Panel(table, title=self.status_title, border_style="blue")

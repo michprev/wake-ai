@@ -41,14 +41,23 @@ class VerboseFormatter:
     step_name: str
     log_with_console_formatting: bool
 
-    def __init__(self, console: Console, step_name: str, log_file: Path | None, verbosity: int, log_with_console_formatting: bool = True):
+    def __init__(
+        self,
+        console: Console,
+        step_name: str,
+        log_file: Path | None,
+        verbosity: int,
+        log_with_console_formatting: bool = True,
+        reset_log_file: bool = True,
+    ):
         self.console = console
         self.log_file = log_file
         self.verbosity = verbosity
         self.step_name = step_name
         self.log_with_console_formatting = log_with_console_formatting
 
-        self.reset_log_file()
+        if reset_log_file:
+            self.reset_log_file()
 
     @contextmanager
     def _file_console(self):

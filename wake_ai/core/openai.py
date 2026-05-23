@@ -42,6 +42,7 @@ logger = get_logger(__name__)
 class OpenAIResponse(NamedTuple):
     cost: float
     status: Literal["running", "terminating_on_max_cost", "succeeded", "terminated", "errored"]
+    final_message: str | None = None
 
 
 def _normalize_mcp_schema(schema: Any) -> dict[str, Any]:
@@ -265,6 +266,7 @@ class OpenAISession(SessionABC):
     _session_id: str | None
     conversation: list[ResponseInputItemParam]
     total_token_usage: OpenAITotalTokenUsage
+    _last_message: str | None
 
     def __init__(
         self,
@@ -323,6 +325,7 @@ class OpenAISession(SessionABC):
             self.conversation = []
         self._session_id = None
         self.total_token_usage = OpenAITotalTokenUsage()
+        self._last_message = None
 
     @property
     def session_id(self) -> str | None:
@@ -457,6 +460,7 @@ class OpenAISession(SessionABC):
         last_flex_successful = True
         compact_reason: str | None = None
         compact_count = 0
+        self._last_message = None
 
         self.conversation.append(EasyInputMessageParam(content=prompt, role="user", type="message"))
 
@@ -532,6 +536,7 @@ class OpenAISession(SessionABC):
                         if isinstance(event.item, ResponseOutputMessage):
                             for content in event.item.content:
                                 if isinstance(content, ResponseOutputText):
+                                    self._last_message = content.text
                                     formatter.print_agent_message(content.text)
                                 elif isinstance(content, ResponseOutputRefusal):
                                     formatter.print_agent_message(content.refusal)
@@ -743,10 +748,10 @@ class OpenAISession(SessionABC):
                 yield OpenAIResponse(cost=current_cost, status="running")
                 if max_cost is not None and current_cost >= max_cost:
                     formatter.print_error(f"Max cost reached ({current_cost:.4f} >= {max_cost:.4f}). Stopping query.")
-                    yield OpenAIResponse(cost=current_cost, status="terminating_on_max_cost")
+                    yield OpenAIResponse(cost=current_cost, status="terminating_on_max_cost", final_message=self._last_message)
                     return
 
-            yield OpenAIResponse(cost=self.total_token_usage.total_cost - initial_cost, status="succeeded")
+            yield OpenAIResponse(cost=self.total_token_usage.total_cost - initial_cost, status="succeeded", final_message=self._last_message)
         finally:
             for client in reversed(opened_clients):
                 await client.__aexit__(None, None, None)

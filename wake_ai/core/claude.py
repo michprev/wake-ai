@@ -57,6 +57,7 @@ DEFAULT_ALLOWED_TOOLS = (
 class ClaudeResponse(NamedTuple):
     cost: float
     status: Literal["running", "terminating_on_max_cost", "succeeded", "terminated", "errored"]
+    final_message: str | None = None
 
 
 async def wrap_prompt(text):
@@ -356,11 +357,11 @@ class ClaudeSession(SessionABC):
             total_cost += result.total_cost_usd or 0.0
 
         if result.subtype == "success":
-            yield ClaudeResponse(cost=total_cost, status="succeeded")
+            yield ClaudeResponse(cost=total_cost, status="succeeded", final_message=result.result)
         elif result.subtype == "error_max_turns":
-            yield ClaudeResponse(cost=total_cost, status="terminated")
+            yield ClaudeResponse(cost=total_cost, status="terminated", final_message=result.result)
         else:
-            yield ClaudeResponse(cost=total_cost, status="errored")
+            yield ClaudeResponse(cost=total_cost, status="errored", final_message=result.result)
             raise RuntimeError(f"Claude Code returned an unexpected subtype: {result.subtype}")
 
     def reset(self) -> None:
