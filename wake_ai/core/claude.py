@@ -35,10 +35,7 @@ DEFAULT_ALLOWED_TOOLS = (
     "LSP",
     "Agent",
     "ListMcpResourcesTool",
-    # Wake MCP
-    "mcp__wake",
-    "mcp__rust-analysis",
-    "mcp___internal",
+    "mcp___internal",  # internal MCP server for native tools
     # Write tools (needed for results - cannot be path-restricted)
     "Write(/{working_dir}/**)",
     "Edit(/{working_dir}/**)",
