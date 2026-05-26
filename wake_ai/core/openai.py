@@ -472,6 +472,10 @@ class OpenAISession(SessionABC):
         self.conversation.append(EasyInputMessageParam(content=prompt, role="user", type="message"))
 
         while True:
+            # Defined before the try so the except handler can always cancel
+            # any tasks spawned mid-stream, even if create() itself failed.
+            tool_calls: dict[str, asyncio.Task[Any]] = {}
+            shell_calls: dict[str, tuple[asyncio.Task[list[ResponseFunctionShellCallOutputContentParam]], ResponseFunctionShellToolCall]] = {}
             try:
                 if compact_reason is not None:
                     compact_count += 1
@@ -524,8 +528,6 @@ class OpenAISession(SessionABC):
                 )
 
                 last_event = None
-                tool_calls: dict[str, asyncio.Task[Any]] = {}
-                shell_calls: dict[str, tuple[asyncio.Task[list[ResponseFunctionShellCallOutputContentParam]], ResponseFunctionShellToolCall]] = {}
 
                 async for event in stream:
                     last_event = event
@@ -615,6 +617,15 @@ class OpenAISession(SessionABC):
                     else:
                         pass
             except (APIError, httpx.RemoteProtocolError, httpx.TimeoutException, ResponseIncompleteError) as e:
+                # Cancel tasks spawned mid-stream before this attempt failed.
+                # Their results are never sent back to the model, and the retry
+                # regenerates the turn from scratch, so leaving them running
+                # risks duplicate side effects (e.g. a shell command run twice).
+                for task in tool_calls.values():
+                    task.cancel()
+                for task, _ in shell_calls.values():
+                    task.cancel()
+
                 if isinstance(e, APIError) and e.code == "context_length_exceeded":
                     logger.warning(f"Context length exceeded, compacting conversation")
                     compact_reason = "context_length_exceeded"
