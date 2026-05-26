@@ -403,7 +403,28 @@ class OpenAISession(SessionABC):
         else:
             return {"isError": result.isError, "content": "\n".join(c.text for c in result.content if isinstance(c, TextContent))}
 
-    async def _stream_messages(self, prompt: str, model: str, mcp_clients: dict[str, ClientSession], formatter: VerboseFormatter) -> AsyncIterator[float]:
+    async def _iter_response_events(self, stream: Any, timeout: float | None) -> AsyncIterator[Any]:
+        """Iterate a streaming response, enforcing an idle timeout between events.
+
+        The SDK/httpx ``timeout`` is not reliably enforced for streaming
+        responses: when OpenAI's backend keeps the connection alive but stalls
+        mid-response, no read gap is observed and the iterator blocks forever.
+        We wrap each ``__anext__`` in ``asyncio.wait_for`` so a stalled stream
+        raises ``asyncio.TimeoutError`` (recoverable via the retry logic) and
+        always close the underlying stream to release the connection.
+        """
+        try:
+            it = stream.__aiter__()
+            while True:
+                try:
+                    event = await asyncio.wait_for(it.__anext__(), timeout=timeout)
+                except StopAsyncIteration:
+                    return
+                yield event
+        finally:
+            await stream.close()
+
+    async def _stream_messages(self, prompt: str, model: str, mcp_clients: dict[str, ClientSession], formatter: VerboseFormatter) -> AsyncIterator[tuple[float, int | None, int]]:
         tools: list[ToolParam] = [
             FunctionToolParam(
                 name=tool.name,
@@ -505,31 +526,34 @@ class OpenAISession(SessionABC):
                         self.conversation.append(EasyInputMessageParam(content="continue", role="user", type="message"))
                     compact_reason = None
 
-                stream = await self.client.responses.create(
-                    input=self.conversation,
-                    model=model,
-                    instructions=self.instructions or omit,
-                    service_tier="default" if service_tier == "standard" else service_tier,
-                    tools=tools or omit,
-                    stream=True,
-                    store=False,
-                    reasoning=Reasoning(
-                        effort=self.reasoning_effort,
-                        summary=self.reasoning_summary,
-                    ),
-                    text=ResponseTextConfigParam(
-                        format=ResponseFormatText(
-                            type="text",
+                stream = await asyncio.wait_for(
+                    self.client.responses.create(
+                        input=self.conversation,
+                        model=model,
+                        instructions=self.instructions or omit,
+                        service_tier="default" if service_tier == "standard" else service_tier,
+                        tools=tools or omit,
+                        stream=True,
+                        store=False,
+                        reasoning=Reasoning(
+                            effort=self.reasoning_effort,
+                            summary=self.reasoning_summary,
                         ),
-                        verbosity=self.output_verbosity,
+                        text=ResponseTextConfigParam(
+                            format=ResponseFormatText(
+                                type="text",
+                            ),
+                            verbosity=self.output_verbosity,
+                        ),
+                        timeout=self.request_timeout,
+                        include=["reasoning.encrypted_content"],
                     ),
                     timeout=self.request_timeout,
-                    include=["reasoning.encrypted_content"],
                 )
 
                 last_event = None
 
-                async for event in stream:
+                async for event in self._iter_response_events(stream, self.request_timeout):
                     last_event = event
                     if isinstance(event, ResponseCreatedEvent):
                         pass
@@ -616,7 +640,7 @@ class OpenAISession(SessionABC):
                         pass
                     else:
                         pass
-            except (APIError, httpx.RemoteProtocolError, httpx.TimeoutException, ResponseIncompleteError) as e:
+            except (APIError, httpx.RemoteProtocolError, httpx.TimeoutException, asyncio.TimeoutError, ResponseIncompleteError) as e:
                 # Cancel tasks spawned mid-stream before this attempt failed.
                 # Their results are never sent back to the model, and the retry
                 # regenerates the turn from scratch, so leaving them running
