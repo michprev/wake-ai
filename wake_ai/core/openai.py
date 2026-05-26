@@ -86,6 +86,12 @@ LEGACY_SHELL_INPUT_SCHEMA = {
 
 MAX_COMPACTIONS = 5
 
+# OpenAI bills the hosted `web_search` tool per call ($10 / 1,000 calls). This
+# fee is NOT reflected in token usage, so we count web-search calls separately
+# and add it into total_cost. Each ResponseFunctionWebSearch item (search /
+# open_page / find action) is one billable call.
+WEB_SEARCH_COST_PER_CALL = 0.01
+
 # Models that support OpenAI's native shell tool (FunctionShellTool).
 # All others fall back to the legacy "shell" function workaround.
 _NATIVE_SHELL_MODEL_PREFIXES = ("gpt-5.1", "gpt-5.2", "gpt-5.4", "gpt-5.5")
@@ -181,6 +187,7 @@ class OpenAITotalTokenUsage:
 
     def __init__(self) -> None:
         self.usage = {}
+        self.web_search_calls = 0
 
     @property
     def total_tokens(self) -> OpenAITokenUsage:
@@ -192,7 +199,7 @@ class OpenAITotalTokenUsage:
 
     @property
     def total_cost(self) -> float:
-        total_cost = 0.0
+        total_cost = self.web_search_calls * WEB_SEARCH_COST_PER_CALL
         for model, tiered_usage in self.usage.items():
             for tier, usage in tiered_usage.items():
                 total_cost += usage.cost
@@ -575,6 +582,10 @@ class OpenAISession(SessionABC):
                         elif isinstance(event.item, ResponseFunctionWebSearch):
                             if event.item.action is not None:
                                 formatter.print_tool_use("web_search", event.item.action.to_dict())
+                                # Per-call fee not captured by token-based pricing.
+                                # Only completed searches are billed (failed ones aren't).
+                                if event.item.status == "completed":
+                                    self.total_token_usage.web_search_calls += 1
                         else:
                             assert False, f"Unexpected item type: {type(event.item)}"
 
