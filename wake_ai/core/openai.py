@@ -43,6 +43,8 @@ class OpenAIResponse(NamedTuple):
     cost: float
     status: Literal["running", "terminating_on_max_cost", "succeeded", "terminated", "errored"]
     final_message: str | None = None
+    context_tokens: int | None = None  # input tokens of the latest request ≈ current context size
+    compaction_count: int = 0
 
 
 def _normalize_mcp_schema(schema: Any) -> dict[str, Any]:
@@ -488,6 +490,7 @@ class OpenAISession(SessionABC):
         last_flex_successful = True
         compact_reason: str | None = None
         compact_count = 0
+        context_tokens: int | None = None
         self._last_message = None
 
         self.conversation.append(EasyInputMessageParam(content=prompt, role="user", type="message"))
@@ -618,6 +621,9 @@ class OpenAISession(SessionABC):
                     elif isinstance(event, (ResponseCompletedEvent, ResponseIncompleteEvent)):
                         response = event.response
                         if response.usage is not None:
+                            # input_tokens = full prompt sent this request (system + tools +
+                            # entire conversation, since store=False) ≈ current context size
+                            context_tokens = response.usage.input_tokens
                             self.total_token_usage.update(
                                 input_tokens_total=response.usage.input_tokens,
                                 input_tokens_cached=response.usage.input_tokens_details.cached_tokens,
@@ -687,7 +693,7 @@ class OpenAISession(SessionABC):
             if self.service_tier == "flex":
                 service_tier = "flex"
 
-            yield self.total_token_usage.total_cost
+            yield self.total_token_usage.total_cost, context_tokens, compact_count
 
             assert response is not None, f"Expected response, got last event: {last_event}"
 
@@ -789,15 +795,17 @@ class OpenAISession(SessionABC):
                 yield OpenAIResponse(cost=0.0, status="terminating_on_max_cost")
                 return
 
-            async for total_cost in self._stream_messages(prompt, model, mcp_clients, formatter):
+            context_tokens: int | None = None
+            compaction_count = 0
+            async for total_cost, context_tokens, compaction_count in self._stream_messages(prompt, model, mcp_clients, formatter):
                 current_cost = total_cost - initial_cost
-                yield OpenAIResponse(cost=current_cost, status="running")
+                yield OpenAIResponse(cost=current_cost, status="running", context_tokens=context_tokens, compaction_count=compaction_count)
                 if max_cost is not None and current_cost >= max_cost:
                     formatter.print_error(f"Max cost reached ({current_cost:.4f} >= {max_cost:.4f}). Stopping query.")
-                    yield OpenAIResponse(cost=current_cost, status="terminating_on_max_cost", final_message=self._last_message)
+                    yield OpenAIResponse(cost=current_cost, status="terminating_on_max_cost", final_message=self._last_message, context_tokens=context_tokens, compaction_count=compaction_count)
                     return
 
-            yield OpenAIResponse(cost=self.total_token_usage.total_cost - initial_cost, status="succeeded", final_message=self._last_message)
+            yield OpenAIResponse(cost=self.total_token_usage.total_cost - initial_cost, status="succeeded", final_message=self._last_message, context_tokens=context_tokens, compaction_count=compaction_count)
         finally:
             for client in reversed(opened_clients):
                 await client.__aexit__(None, None, None)

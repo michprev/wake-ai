@@ -6,7 +6,7 @@ from functools import partial
 from pathlib import Path
 from typing import AsyncIterator, NamedTuple, Literal, Callable, Awaitable, Any
 
-from claude_agent_sdk import AgentDefinition, AssistantMessage, ClaudeAgentOptions, McpServerConfig, Message, ResultMessage, SandboxIgnoreViolations, SandboxNetworkConfig, SandboxSettings, SystemMessage, TaskNotificationMessage, TaskProgressMessage, TaskStartedMessage, TextBlock, ThinkingBlock, ToolResultBlock, ToolUseBlock, UserMessage, query, create_sdk_mcp_server, SdkMcpTool
+from claude_agent_sdk import AgentDefinition, AssistantMessage, ClaudeAgentOptions, HookContext, HookInput, HookJSONOutput, HookMatcher, McpServerConfig, Message, ResultMessage, SandboxIgnoreViolations, SandboxNetworkConfig, SandboxSettings, SystemMessage, TaskNotificationMessage, TaskProgressMessage, TaskStartedMessage, TextBlock, ThinkingBlock, ToolResultBlock, ToolUseBlock, UserMessage, query, create_sdk_mcp_server, SdkMcpTool
 from claude_agent_sdk.types import SystemPromptPreset
 
 from .session_abc import SessionABC, FunctionTool
@@ -58,6 +58,19 @@ class ClaudeResponse(NamedTuple):
     cost: float
     status: Literal["running", "terminating_on_max_cost", "succeeded", "terminated", "errored"]
     final_message: str | None = None
+    context_tokens: int | None = None  # not yet collected for Claude
+    compaction_count: int = 0
+
+
+def _context_tokens_from_usage(usage: dict[str, Any] | None) -> int | None:
+    """Context size = the full prompt sent on the final turn (fresh + cached input)."""
+    if not usage:
+        return None
+    return (
+        (usage.get("input_tokens") or 0)
+        + (usage.get("cache_read_input_tokens") or 0)
+        + (usage.get("cache_creation_input_tokens") or 0)
+    )
 
 
 async def wrap_prompt(text):
@@ -259,6 +272,13 @@ class ClaudeSession(SessionABC):
         else:
             mcps = self.mcp_servers
 
+        compact_count = 0
+
+        async def pre_compact_hook(input: HookInput, tool_use_id: str | None, context: HookContext) -> HookJSONOutput:
+            nonlocal compact_count
+            compact_count += 1
+            return {}
+
         options = ClaudeAgentOptions(
             add_dirs=[Path.home() / ".config/wake", Path.home() / ".cache/wake/explorers"],
             system_prompt=self.system_prompt,
@@ -296,6 +316,11 @@ class ClaudeSession(SessionABC):
                 enableWeakerNestedSandbox=False,
             ),
             skills=[] if self.ignore_skills else None,
+            hooks={
+                "PreCompact": [
+                    HookMatcher(hooks=[pre_compact_hook])
+                ]
+            }
         )
 
         total_cost = 0.0
@@ -324,7 +349,7 @@ class ClaudeSession(SessionABC):
         options.fork_session = False
 
         while result.subtype == "error_max_turns" and (max_cost is None or total_cost < max_cost):
-            yield ClaudeResponse(cost=total_cost, status="running")
+            yield ClaudeResponse(cost=total_cost, status="running", context_tokens=_context_tokens_from_usage(result.usage), compaction_count=compact_count)
 
             formatter.print_user_message("continue")
 
@@ -341,7 +366,7 @@ class ClaudeSession(SessionABC):
         termination_attempt = 0
         while result.subtype == "error_max_turns" and termination_attempt < MAX_TERMINATION_ATTEMPTS:
             termination_attempt += 1
-            yield ClaudeResponse(cost=total_cost, status="terminating_on_max_cost")
+            yield ClaudeResponse(cost=total_cost, status="terminating_on_max_cost", context_tokens=_context_tokens_from_usage(result.usage), compaction_count=compact_count)
 
             termination_prompt = TERMINATION_PROMPT.format(finish_tries=termination_attempt, max_finish_tries=MAX_TERMINATION_ATTEMPTS)
 
@@ -357,12 +382,13 @@ class ClaudeSession(SessionABC):
             assert result is not None
             total_cost += result.total_cost_usd or 0.0
 
+        context_tokens = _context_tokens_from_usage(result.usage)
         if result.subtype == "success":
-            yield ClaudeResponse(cost=total_cost, status="succeeded", final_message=result.result)
+            yield ClaudeResponse(cost=total_cost, status="succeeded", final_message=result.result, context_tokens=context_tokens, compaction_count=compact_count)
         elif result.subtype == "error_max_turns":
-            yield ClaudeResponse(cost=total_cost, status="terminated", final_message=result.result)
+            yield ClaudeResponse(cost=total_cost, status="terminated", final_message=result.result, context_tokens=context_tokens, compaction_count=compact_count)
         else:
-            yield ClaudeResponse(cost=total_cost, status="errored", final_message=result.result)
+            yield ClaudeResponse(cost=total_cost, status="errored", final_message=result.result, context_tokens=context_tokens, compaction_count=compact_count)
             raise RuntimeError(f"Claude Code returned an unexpected subtype: {result.subtype}")
 
     def reset(self) -> None:

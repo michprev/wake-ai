@@ -111,6 +111,19 @@ def _format_duration(seconds: float) -> str:
         return f"{secs:.2f}s"
 
 
+def _format_context(tokens: int | None, compactions: int = 0) -> str:
+    """Format context size (e.g. '252k') with an optional compaction count ('252k ⟳2')."""
+    if not tokens:
+        return "-"
+    if tokens >= 1000:
+        size = f"{tokens / 1000:.0f}k"
+    else:
+        size = str(tokens)
+    if compactions:
+        size += f" ⟳{compactions}"
+    return size
+
+
 def require_initialized(func):
     """Decorator to ensure __init__ was called on AIWorkflow instances."""
 
@@ -211,6 +224,8 @@ class SubStep:
     current_call_start: datetime | None = None  # set during an active call
     invocation_count: int = 0
     last_error: BaseException | None = None
+    context_tokens: int | None = None  # context size of the latest call (last-wins)
+    compaction_count: int = 0  # cumulative across all calls
     substeps: list[SubStep] = field(default_factory=list)
 
     @property
@@ -304,6 +319,7 @@ async def _run_subagent(
             sub.formatter = formatter
 
     starting_cost = sub.cost
+    starting_compactions = sub.compaction_count
     sub.invocation_count += 1
     sub.current_call_start = datetime.now()
 
@@ -314,8 +330,12 @@ async def _run_subagent(
     last_info = None
     try:
         async for info in session.query(prompt, model, max_cost, sub.formatter):
-            # info.cost is the running total for THIS query call only
+            # info.cost / info.compaction_count are running totals for THIS query
+            # call only; accumulate across calls. context_tokens is an absolute
+            # current size, so last value wins. Backends may omit these fields.
             sub.cost = starting_cost + info.cost
+            sub.context_tokens = getattr(info, "context_tokens", None)
+            sub.compaction_count = starting_compactions + getattr(info, "compaction_count", 0)
             last_info = info
     except BaseException as e:
         sub.last_error = e
@@ -380,6 +400,8 @@ class WorkflowStep:
     failed_attempts: list[FailedWorkflowStep] = field(default_factory=list)
     substeps: list[SubStep] = field(default_factory=list)
     cost: float = 0.0
+    context_tokens: int | None = None  # context size of the latest call (last-wins)
+    compaction_count: int = 0  # cumulative across all calls (incl. validation retries)
     start_time: datetime | None = None
     end_time: datetime | None = None
     error: BaseException | None = None
@@ -700,9 +722,15 @@ class AIWorkflow(ABC):
                 step.max_cost,
                 step.formatter,
             ):
+                # context_tokens: absolute current size (last-wins). cost /
+                # compaction_count: per-call running totals accumulated across the
+                # query calls that make up this row. Backends may omit these fields.
                 step.cost = info.cost
+                step.context_tokens = getattr(info, "context_tokens", None)
+                step.compaction_count = getattr(info, "compaction_count", 0)
 
             total_cost = step.cost
+            total_compactions = step.compaction_count
 
             # validation + fixing attempts
             if step.validator is not None:
@@ -720,8 +748,11 @@ class AIWorkflow(ABC):
                         step.formatter,
                     ):
                         step.cost = total_cost + info.cost
+                        step.context_tokens = getattr(info, "context_tokens", None)
+                        step.compaction_count = total_compactions + getattr(info, "compaction_count", 0)
 
                     total_cost = step.cost
+                    total_compactions = step.compaction_count
 
                     errors = step.validator(step)
 
@@ -913,6 +944,7 @@ class AIWorkflow(ABC):
             f"{indent}└─ {glyph} {sub.name}{suffix}",
             "",
             sub.model,
+            _format_context(sub.context_tokens, sub.compaction_count),
             sub_duration,
             sub_cost,
             style=style,
@@ -931,10 +963,11 @@ class AIWorkflow(ABC):
             padding=(0, 1),
         )
         table.add_column("Step", no_wrap=True, width=60)
-        table.add_column("Attempt", no_wrap=True, width=20)
-        table.add_column("Model", no_wrap=True, width=25)
-        table.add_column("Time", justify="right", width=20)
-        table.add_column("Cost", justify="right", width=20)
+        table.add_column("Attempt", no_wrap=True, width=9)
+        table.add_column("Model", no_wrap=True, width=18)
+        table.add_column("Context", justify="right", width=12)
+        table.add_column("Time", justify="right", width=12)
+        table.add_column("Cost", justify="right", width=10)
 
         # Add rows for each step
         for step in self.steps:
@@ -989,6 +1022,7 @@ class AIWorkflow(ABC):
                         f"✗ {step.name}",
                         f"{i + 1}/{step.retries + 1}",
                         model,
+                        "",
                         _format_duration((failed_attempt.end_time - failed_attempt.start_time).total_seconds()),
                         f"${failed_attempt.cost:.4f}",
                         style="dim red",
@@ -997,7 +1031,7 @@ class AIWorkflow(ABC):
                     for sub in failed_attempt.substeps:
                         self._render_substep_tree(table, sub, parent_status="failed", stale=True)
 
-            table.add_row(step_name, attempt, model, duration, cost, style=row_style)
+            table.add_row(step_name, attempt, model, _format_context(step.context_tokens, step.compaction_count), duration, cost, style=row_style)
 
             # current-attempt substeps (status mirrors parent)
             if isinstance(step, WorkflowStep):
@@ -1015,6 +1049,7 @@ class AIWorkflow(ABC):
         table.add_section()
         table.add_row(
             "Total",
+            "",
             "",
             "",
             f"{_format_duration((datetime.now() - self.start_time).total_seconds())}",
@@ -1041,7 +1076,7 @@ class AIWorkflow(ABC):
 
         if current_snapshot != self._last_status_snapshot:
             buffer = StringIO()
-            log_console = Console(file=buffer, force_terminal=False, width=84)
+            log_console = Console(file=buffer, force_terminal=False)
             log_console.print(table)
             with open(self.steps_log_file, "w") as f:
                 f.write(buffer.getvalue())
