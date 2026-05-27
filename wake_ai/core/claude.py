@@ -162,7 +162,6 @@ class ClaudeSession(SessionABC):
             self.env = env
 
         self.env["CLAUDECODE"] = ""
-        self.env["CLAUDE_CODE_EXTRA_BODY"] = "{\"thinking\":{\"type\":\"adaptive\",\"display\":\"summarized\"}}"
 
         self.effort = effort
         self.turn_step = turn_step
@@ -279,6 +278,28 @@ class ClaudeSession(SessionABC):
             compact_count += 1
             return {}
 
+        network_config = SandboxNetworkConfig(
+            allowAllUnixSockets=self.shell_network_access,
+            allowLocalBinding=self.shell_network_access,
+            deniedDomains=[],
+        )
+        if self.shell_network_access:
+            # macOS specifics for granting outbound network access:
+            # - allowLocalBinding (above) lets the seatbelt sandbox permit direct
+            #   outbound TCP; without it direct connections fail with EPERM.
+            # - allowMachLookup for trustd lets Go/system-TLS clients (e.g. gh) reach
+            #   the macOS trust daemon to verify certificates; without it they fail
+            #   with `x509: OSStatus -26276`.
+            # The CLI still injects HTTP(S)/SOCKS proxy env vars (which we cannot
+            # override via `env`) that 403 every non-allowlisted host, so commands
+            # must bypass the proxy per-invocation with `no_proxy='*' NO_PROXY='*'`.
+            network_config["allowMachLookup"] = ["com.apple.trustd*"]
+        else:
+            # Any non-None allowedDomains (even []) activates the proxy allowlist; an
+            # empty list matches nothing, so all outbound traffic is blocked. Combined
+            # with allowLocalBinding=False this leaves no path to the network.
+            network_config["allowedDomains"] = []
+
         options = ClaudeAgentOptions(
             add_dirs=[Path.home() / ".config/wake", Path.home() / ".cache/wake/explorers"],
             system_prompt=self.system_prompt,
@@ -301,11 +322,7 @@ class ClaudeSession(SessionABC):
                 autoAllowBashIfSandboxed=True,
                 excludedCommands=[],
                 allowUnsandboxedCommands=False,
-                network=SandboxNetworkConfig(
-                    allowAllUnixSockets=self.shell_network_access,
-                    allowLocalBinding=self.shell_network_access,
-                    allowedDomains=["*"],
-                ),
+                network=network_config,
                 ignoreViolations=SandboxIgnoreViolations(
                     file=[
                         self.working_dir.resolve().as_posix(),
