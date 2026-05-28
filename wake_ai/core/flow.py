@@ -534,6 +534,13 @@ class AIWorkflow(ABC):
         self.working_dir.mkdir(parents=True, exist_ok=True)
         self.steps_log_file = self.working_dir / "steps.log"
 
+        # Back up an existing steps.log to steps.{i}.log, same as VerboseFormatter
+        if self.steps_log_file.exists():
+            i = 0
+            while self.steps_log_file.with_suffix(f".{i}.log").exists():
+                i += 1
+            self.steps_log_file.rename(self.steps_log_file.with_suffix(f".{i}.log"))
+
         self.show_progress = (
             show_progress
             if show_progress is not None
