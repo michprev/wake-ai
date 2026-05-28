@@ -6,7 +6,7 @@ from functools import partial
 from pathlib import Path
 from typing import AsyncIterator, NamedTuple, Literal, Callable, Awaitable, Any
 
-from claude_agent_sdk import AgentDefinition, AssistantMessage, ClaudeAgentOptions, HookContext, HookInput, HookJSONOutput, HookMatcher, McpServerConfig, Message, ResultMessage, SandboxIgnoreViolations, SandboxNetworkConfig, SandboxSettings, SystemMessage, TaskNotificationMessage, TaskProgressMessage, TaskStartedMessage, TextBlock, ThinkingBlock, ToolResultBlock, ToolUseBlock, UserMessage, query, create_sdk_mcp_server, SdkMcpTool
+from claude_agent_sdk import AgentDefinition, AssistantMessage, ClaudeAgentOptions, ClaudeSDKClient, HookContext, HookInput, HookJSONOutput, HookMatcher, McpServerConfig, Message, ResultMessage, SandboxIgnoreViolations, SandboxNetworkConfig, SandboxSettings, SystemMessage, TaskNotificationMessage, TaskProgressMessage, TaskStartedMessage, TextBlock, ThinkingBlock, ToolResultBlock, ToolUseBlock, UserMessage, create_sdk_mcp_server, SdkMcpTool
 from claude_agent_sdk.types import SystemPromptPreset
 
 from .session_abc import SessionABC, FunctionTool
@@ -58,23 +58,8 @@ class ClaudeResponse(NamedTuple):
     cost: float
     status: Literal["running", "terminating_on_max_cost", "succeeded", "terminated", "errored"]
     final_message: str | None = None
-    context_tokens: int | None = None  # not yet collected for Claude
+    context_tokens: int | None = None
     compaction_count: int = 0
-
-
-def _context_tokens_from_usage(usage: dict[str, Any] | None) -> int | None:
-    """Context size = the full prompt sent on the final turn (fresh + cached input)."""
-    if not usage:
-        return None
-    return (
-        (usage.get("input_tokens") or 0)
-        + (usage.get("cache_read_input_tokens") or 0)
-        + (usage.get("cache_creation_input_tokens") or 0)
-    )
-
-
-async def wrap_prompt(text):
-    yield {"type": "user", "message": {"role": "user", "content": text}}
 
 
 async def tool_wrapper(handler: Callable[..., Awaitable[Any]], args: dict[str, Any]) -> Any:
@@ -236,7 +221,7 @@ class ClaudeSession(SessionABC):
             elif isinstance(message, TaskNotificationMessage):
                 formatter.print_system_message(f"Task {message.status}: {message.summary}")
             else:
-                logger.warning(f"Unexpected Claude system message subtype: {message.subtype}")
+                logger.warning(f"Unexpected Claude system message subtype: {message.subtype}; {message.data}")
         elif isinstance(message, ResultMessage):
             pass
         else:
@@ -350,62 +335,63 @@ class ClaudeSession(SessionABC):
 
         formatter.print_user_message(prompt)
 
-        # initial query
-        async for message in query(prompt=wrap_prompt(prompt), options=options):
-            self._process_message(message, formatter)
-            # ResultMessage indicates the response is complete.
-            if isinstance(message, ResultMessage):
-                result = message
+        # A single client is kept alive for the whole query: the initial turn plus
+        # any "continue"/termination turns share one streaming session. This also
+        # lets us read accurate, live context usage via get_context_usage() after
+        # each message (it's a local IPC round-trip to the CLI, not an API call).
+        client = ClaudeSDKClient(options=options)
+        await client.connect()
+        try:
+            async def context_tokens() -> int | None:
+                """Accurate context window size (matches the CLI `/context` command)."""
+                try:
+                    return (await client.get_context_usage())["totalTokens"]
+                except Exception as e:
+                    logger.warning(f"Failed to read Claude context usage: {e}")
+                    return None
 
-        assert result is not None
-        total_cost += result.total_cost_usd or 0.0
+            async def run_turn(turn_prompt: str, status: Literal["running", "terminating_on_max_cost"]) -> AsyncIterator[ClaudeResponse]:
+                """Run one turn, yielding a live progress update after each message."""
+                nonlocal result, total_cost
+                await client.query(turn_prompt)
+                async for message in client.receive_response():
+                    self._process_message(message, formatter)
+                    # ResultMessage indicates the turn is complete; fold in its cost.
+                    if isinstance(message, ResultMessage):
+                        result = message
+                        total_cost += message.total_cost_usd or 0.0
+                    yield ClaudeResponse(cost=total_cost, status=status, context_tokens=await context_tokens(), compaction_count=compact_count)
 
-        assert self._session_id is not None
-        # from now on we must keep using the same session id
-        options.resume = self._session_id
-        options.fork_session = False
-
-        while result.subtype == "error_max_turns" and (max_cost is None or total_cost < max_cost):
-            yield ClaudeResponse(cost=total_cost, status="running", context_tokens=_context_tokens_from_usage(result.usage), compaction_count=compact_count)
-
-            formatter.print_user_message("continue")
-
-            result = None
-            async for message in query(prompt=wrap_prompt("continue"), options=options):
-                self._process_message(message, formatter)
-                # ResultMessage indicates the response is complete.
-                if isinstance(message, ResultMessage):
-                    result = message
-
+            # initial query
+            async for info in run_turn(prompt, "running"):
+                yield info
             assert result is not None
-            total_cost += result.total_cost_usd or 0.0
+            assert self._session_id is not None
 
-        termination_attempt = 0
-        while result.subtype == "error_max_turns" and termination_attempt < MAX_TERMINATION_ATTEMPTS:
-            termination_attempt += 1
-            yield ClaudeResponse(cost=total_cost, status="terminating_on_max_cost", context_tokens=_context_tokens_from_usage(result.usage), compaction_count=compact_count)
+            while result.subtype == "error_max_turns" and (max_cost is None or total_cost < max_cost):
+                formatter.print_user_message("continue")
+                async for info in run_turn("continue", "running"):
+                    yield info
 
-            termination_prompt = TERMINATION_PROMPT.format(finish_tries=termination_attempt, max_finish_tries=MAX_TERMINATION_ATTEMPTS)
+            termination_attempt = 0
+            while result.subtype == "error_max_turns" and termination_attempt < MAX_TERMINATION_ATTEMPTS:
+                termination_attempt += 1
+                termination_prompt = TERMINATION_PROMPT.format(finish_tries=termination_attempt, max_finish_tries=MAX_TERMINATION_ATTEMPTS)
 
-            formatter.print_user_message(termination_prompt)
+                formatter.print_user_message(termination_prompt)
+                async for info in run_turn(termination_prompt, "terminating_on_max_cost"):
+                    yield info
 
-            result = None
-            async for message in query(prompt=wrap_prompt(termination_prompt), options=options):
-                self._process_message(message, formatter)
-                # ResultMessage indicates the response is complete.
-                if isinstance(message, ResultMessage):
-                    result = message
+            final_context_tokens = await context_tokens()
+        finally:
+            await client.disconnect()
 
-            assert result is not None
-            total_cost += result.total_cost_usd or 0.0
-
-        context_tokens = _context_tokens_from_usage(result.usage)
         if result.subtype == "success":
-            yield ClaudeResponse(cost=total_cost, status="succeeded", final_message=result.result, context_tokens=context_tokens, compaction_count=compact_count)
+            yield ClaudeResponse(cost=total_cost, status="succeeded", final_message=result.result, context_tokens=final_context_tokens, compaction_count=compact_count)
         elif result.subtype == "error_max_turns":
-            yield ClaudeResponse(cost=total_cost, status="terminated", final_message=result.result, context_tokens=context_tokens, compaction_count=compact_count)
+            yield ClaudeResponse(cost=total_cost, status="terminated", final_message=result.result, context_tokens=final_context_tokens, compaction_count=compact_count)
         else:
-            yield ClaudeResponse(cost=total_cost, status="errored", final_message=result.result, context_tokens=context_tokens, compaction_count=compact_count)
+            yield ClaudeResponse(cost=total_cost, status="errored", final_message=result.result, context_tokens=final_context_tokens, compaction_count=compact_count)
             raise RuntimeError(f"Claude Code returned an unexpected subtype: {result.subtype}")
 
     def reset(self) -> None:
