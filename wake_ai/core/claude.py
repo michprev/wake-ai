@@ -62,6 +62,31 @@ class ClaudeResponse(NamedTuple):
     compaction_count: int = 0
 
 
+def _accumulate_model_usage(acc: dict[str, dict[str, float]], model_usage: dict[str, Any] | None) -> None:
+    """Sum per-model numeric token counters from a turn's ResultMessage into ``acc``."""
+    if not model_usage:
+        return
+    for model, usage in model_usage.items():
+        if not isinstance(usage, dict):
+            continue
+        model_acc = acc.setdefault(model, {})
+        for key, value in usage.items():
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                continue
+            model_acc[key] = model_acc.get(key, 0.0) + value
+
+
+def _format_token_usage(acc: dict[str, dict[str, float]]) -> str:
+    lines = ["Token usage:"]
+    for model, usage in acc.items():
+        parts = ", ".join(
+            f"{k}={int(v) if float(v).is_integer() else round(v, 6)}"
+            for k, v in usage.items()
+        )
+        lines.append(f"  {model}: {parts}")
+    return "\n".join(lines)
+
+
 async def tool_wrapper(handler: Callable[..., Awaitable[Any]], args: dict[str, Any]) -> Any:
     return {
         "content": [
@@ -302,6 +327,11 @@ class ClaudeSession(SessionABC):
             env=self.env,
             max_buffer_size=10 * 1024 * 1024 * 1024,  # 10GB
             effort=self.effort,
+            hooks={
+                "PreCompact": [
+                    HookMatcher(hooks=[pre_compact_hook])
+                ]
+            },
             sandbox=SandboxSettings(
                 enabled=True,
                 autoAllowBashIfSandboxed=True,
@@ -327,6 +357,9 @@ class ClaudeSession(SessionABC):
 
         total_cost = 0.0
         result: ResultMessage | None = None
+        accumulated_usage: dict[str, dict[str, float]] = {}
+        context_size: int | None = None
+        refreshed_compact_count = -1  # forces a refresh on the very first message
 
         if isinstance(self.system_prompt, str):
             formatter.print_system_message(f"System prompt:\n{self.system_prompt}")
@@ -352,7 +385,7 @@ class ClaudeSession(SessionABC):
 
             async def run_turn(turn_prompt: str, status: Literal["running", "terminating_on_max_cost"]) -> AsyncIterator[ClaudeResponse]:
                 """Run one turn, yielding a live progress update after each message."""
-                nonlocal result, total_cost
+                nonlocal result, total_cost, context_size, refreshed_compact_count
                 await client.query(turn_prompt)
                 async for message in client.receive_response():
                     self._process_message(message, formatter)
@@ -360,7 +393,19 @@ class ClaudeSession(SessionABC):
                     if isinstance(message, ResultMessage):
                         result = message
                         total_cost += message.total_cost_usd or 0.0
-                    yield ClaudeResponse(cost=total_cost, status=status, context_tokens=await context_tokens(), compaction_count=compact_count)
+                        _accumulate_model_usage(accumulated_usage, message.model_usage)
+                    # Progress only changes when an API call completes (top-level
+                    # assistant output, turn result) or after a compaction; other
+                    # messages would repeat the previous values, so skip both the
+                    # context-usage IPC round-trip and the yield.
+                    if (
+                        isinstance(message, ResultMessage)
+                        or (isinstance(message, AssistantMessage) and message.parent_tool_use_id is None)
+                        or compact_count != refreshed_compact_count
+                    ):
+                        context_size = await context_tokens()
+                        refreshed_compact_count = compact_count
+                        yield ClaudeResponse(cost=total_cost, status=status, context_tokens=context_size, compaction_count=compact_count)
 
             # initial query
             async for info in run_turn(prompt, "running"):
@@ -381,17 +426,17 @@ class ClaudeSession(SessionABC):
                 formatter.print_user_message(termination_prompt)
                 async for info in run_turn(termination_prompt, "terminating_on_max_cost"):
                     yield info
-
-            final_context_tokens = await context_tokens()
         finally:
             await client.disconnect()
 
+        formatter.print_system_message(_format_token_usage(accumulated_usage))
+
         if result.subtype == "success":
-            yield ClaudeResponse(cost=total_cost, status="succeeded", final_message=result.result, context_tokens=final_context_tokens, compaction_count=compact_count)
+            yield ClaudeResponse(cost=total_cost, status="succeeded", final_message=result.result, context_tokens=context_size, compaction_count=compact_count)
         elif result.subtype == "error_max_turns":
-            yield ClaudeResponse(cost=total_cost, status="terminated", final_message=result.result, context_tokens=final_context_tokens, compaction_count=compact_count)
+            yield ClaudeResponse(cost=total_cost, status="terminated", final_message=result.result, context_tokens=context_size, compaction_count=compact_count)
         else:
-            yield ClaudeResponse(cost=total_cost, status="errored", final_message=result.result, context_tokens=final_context_tokens, compaction_count=compact_count)
+            yield ClaudeResponse(cost=total_cost, status="errored", final_message=result.result, context_tokens=context_size, compaction_count=compact_count)
             raise RuntimeError(f"Claude Code returned an unexpected subtype: {result.subtype}")
 
     def reset(self) -> None:

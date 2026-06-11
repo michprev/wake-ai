@@ -223,6 +223,28 @@ class OpenAITotalTokenUsage:
             }
         self.usage[model][tier].update(model, tier, input_tokens_total, input_tokens_cached, output_tokens)
 
+    def format_summary(self) -> str:
+        lines = ["Token usage:"]
+        for model, tiered_usage in self.usage.items():
+            for tier, usage in tiered_usage.items():
+                if usage.input_tokens_total == 0 and usage.output_tokens == 0:
+                    continue
+                lines.append(
+                    f"  {model} ({tier}): input={usage.input_tokens_total} "
+                    f"(cached {usage.input_tokens_cached}), output={usage.output_tokens}, "
+                    f"cost=${usage.cost:.4f}"
+                )
+        total = self.total_tokens
+        summary = (
+            f"  total: input={total.input_tokens_total} "
+            f"(cached {total.input_tokens_cached}), output={total.output_tokens}"
+        )
+        if self.web_search_calls:
+            summary += f", web_search_calls={self.web_search_calls}"
+        summary += f", cost=${self.total_cost:.4f}"
+        lines.append(summary)
+        return "\n".join(lines)
+
 
 @dataclass
 class SSEServerParameters:
@@ -802,9 +824,11 @@ class OpenAISession(SessionABC):
                 yield OpenAIResponse(cost=current_cost, status="running", context_tokens=context_tokens, compaction_count=compaction_count)
                 if max_cost is not None and current_cost >= max_cost:
                     formatter.print_error(f"Max cost reached ({current_cost:.4f} >= {max_cost:.4f}). Stopping query.")
+                    formatter.print_system_message(self.total_token_usage.format_summary())
                     yield OpenAIResponse(cost=current_cost, status="terminating_on_max_cost", final_message=self._last_message, context_tokens=context_tokens, compaction_count=compaction_count)
                     return
 
+            formatter.print_system_message(self.total_token_usage.format_summary())
             yield OpenAIResponse(cost=self.total_token_usage.total_cost - initial_cost, status="succeeded", final_message=self._last_message, context_tokens=context_tokens, compaction_count=compaction_count)
         finally:
             for client in reversed(opened_clients):
