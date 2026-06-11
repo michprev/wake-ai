@@ -112,7 +112,10 @@ class ClaudeSession(SessionABC):
     env: dict[str, str]
     effort: Literal["low", "medium", "high", "max"] | None
     turn_step: int | None
+    sandbox: bool
     shell_network_access: bool
+    extra_shell_writable_roots: list[Path | str]
+    weaker_nested_sandbox: bool
     ignore_skills: bool
 
     def __init__(
@@ -131,7 +134,10 @@ class ClaudeSession(SessionABC):
         env: dict[str, str] | None = None,
         effort: Literal["low", "medium", "high", "max"] | None = None,
         turn_step: int | None = None,
+        sandbox: bool = True,
         shell_network_access: bool = False,
+        extra_shell_writable_roots: list[Path | str] | None = None,
+        weaker_nested_sandbox: bool = False,
         ignore_skills: bool = True,
     ):
         if session_id is not None and fork_session is not None:
@@ -175,7 +181,10 @@ class ClaudeSession(SessionABC):
 
         self.effort = effort
         self.turn_step = turn_step
+        self.sandbox = sandbox
         self.shell_network_access = shell_network_access
+        self.extra_shell_writable_roots = extra_shell_writable_roots or []
+        self.weaker_nested_sandbox = weaker_nested_sandbox
         self.ignore_skills = ignore_skills
 
     @property
@@ -239,6 +248,8 @@ class ClaudeSession(SessionABC):
                     f"Session: {message.data.get('session_id', 'N/A')}"
                 )
                 formatter.print_system_message(status)
+            elif message.subtype == "thinking_tokens":
+                pass  # not interesting
             elif isinstance(message, TaskStartedMessage):
                 formatter.print_system_message(f"Task started: {message.description}")
             elif isinstance(message, TaskProgressMessage):
@@ -327,6 +338,7 @@ class ClaudeSession(SessionABC):
             env=self.env,
             max_buffer_size=10 * 1024 * 1024 * 1024,  # 10GB
             effort=self.effort,
+            skills=[] if self.ignore_skills else None,
             hooks={
                 "PreCompact": [
                     HookMatcher(hooks=[pre_compact_hook])
@@ -343,16 +355,10 @@ class ClaudeSession(SessionABC):
                         self.working_dir.resolve().as_posix(),
                         Path(os.environ.get("TMPDIR") or tempfile.gettempdir()).resolve().as_posix(),
                         "/private/tmp",
-                    ],
+                    ] + [Path(root).resolve().as_posix() for root in self.extra_shell_writable_roots],
                 ),
-                enableWeakerNestedSandbox=False,
-            ),
-            skills=[] if self.ignore_skills else None,
-            hooks={
-                "PreCompact": [
-                    HookMatcher(hooks=[pre_compact_hook])
-                ]
-            }
+                enableWeakerNestedSandbox=self.weaker_nested_sandbox,
+            ) if self.sandbox else None
         )
 
         total_cost = 0.0
