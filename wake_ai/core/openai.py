@@ -176,7 +176,7 @@ class OpenAITokenUsage:
         cached_input_cost = input_tokens_cached * GPT_PRICING[model][tier].cached_input_mtoken_cost / 1e6
         output_cost = output_tokens * GPT_PRICING[model][tier].output_mtoken_cost / 1e6
 
-        if model in {"gpt-5.4", "gpt-5.4-pro"} and input_tokens_total >= 272_000:
+        if model in {"gpt-5.4", "gpt-5.4-pro", "gpt-5.5", "gpt-5.5-pro"} and input_tokens_total >= 272_000:
             input_cost *= 2
             cached_input_cost *= 2
             output_cost *= 1.5
