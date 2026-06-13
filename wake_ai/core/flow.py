@@ -366,6 +366,21 @@ def _tree_in_call(substeps: list[SubStep]) -> bool:
     )
 
 
+def _count_subagents(substeps: list[SubStep]) -> int:
+    """Total number of SubSteps in the subtree."""
+    return sum(1 + _count_subagents(s.substeps) for s in substeps)
+
+
+def _collect_in_call(substeps: list[SubStep], depth: int = 1) -> list[tuple[int, SubStep]]:
+    """The live frontier: every in-call SubStep in the subtree, with its depth."""
+    out: list[tuple[int, SubStep]] = []
+    for sub in substeps:
+        if sub.current_call_start is not None:
+            out.append((depth, sub))
+        out.extend(_collect_in_call(sub.substeps, depth + 1))
+    return out
+
+
 def _substep_snapshot(sub: SubStep) -> tuple:
     return (
         sub.name,
@@ -1120,110 +1135,193 @@ class AIWorkflow(ABC):
         for child in sub.substeps:
             cls._render_substep_tree(table, child, parent_status, stale)
 
-    def _get_status_display(self) -> Panel:
-        """Build the status display with table and progress."""
-        table = Table(
-            show_header=True,
-            header_style="bold cyan",
-            box=None,
-            padding=(0, 1),
-        )
-        table.add_column("Step", no_wrap=True, width=60)
+    def _make_status_table(self) -> Table:
+        # Every column no_wrap so a logical row always renders as exactly one
+        # terminal line — that keeps the compact view's row budget an exact line
+        # budget, so it can never overflow vertically (it crops/ellipsizes width).
+        table = Table(show_header=True, header_style="bold cyan", box=None, padding=(0, 1))
+        table.add_column("Step", no_wrap=True, width=60, overflow="ellipsis")
         table.add_column("Attempt", no_wrap=True, width=9)
-        table.add_column("Model", no_wrap=True, width=18)
-        table.add_column("Context", justify="right", width=12)
-        table.add_column("Time", justify="right", width=12)
-        table.add_column("Cost", justify="right", width=10)
+        table.add_column("Model", no_wrap=True, width=18, overflow="ellipsis")
+        table.add_column("Context", justify="right", no_wrap=True, width=12)
+        table.add_column("Time", justify="right", no_wrap=True, width=12)
+        table.add_column("Cost", justify="right", no_wrap=True, width=10)
+        return table
 
-        # Add rows for each step
-        for step in self.steps:
-            if isinstance(step, DynamicWorkflowStep):
-                continue
+    def _step_row(self, step: WorkflowStep) -> tuple[list[str], str]:
+        """(cells, style) for a WorkflowStep's own row."""
+        prefix, row_style = {
+            "pending": ("  ", "dim"),
+            "completed": ("✓ ", "green"),
+            "skipped": ("○ ", "yellow"),
+            "running": ("⟳ ", "bright_cyan"),
+            "failed": ("✗ ", "red"),
+        }.get(step.status, ("  ", "dim"))
 
-            # Determine row style based on status
-            if step.status == "pending":
-                row_style = "dim"
-                step_name = f"  {step.name}"
-            elif step.status == "completed":
-                row_style = "green"
-                step_name = f"✓ {step.name}"
-            elif step.status == "skipped":
-                row_style = "yellow"
-                step_name = f"○ {step.name}"
-            elif step.status == "running":
-                row_style = "bright_cyan"
-                step_name = f"⟳ {step.name}"
-            else:
-                row_style = "red"
-                step_name = f"✗ {step.name}"
+        if step.status == "running" and step.start_time:
+            duration = _format_duration((datetime.now() - step.start_time).total_seconds())
+        elif step.end_time and step.start_time:
+            duration = _format_duration((step.end_time - step.start_time).total_seconds())
+        else:
+            duration = "-"
 
-            # Format duration (show live time for running steps)
-            if step.status == "running" and step.start_time:
-                # Calculate current running time
-                running_time = (datetime.now() - step.start_time).total_seconds()
-                duration = _format_duration(running_time)
-            elif step.end_time and step.start_time:
-                duration = _format_duration(
-                    (step.end_time - step.start_time).total_seconds()
-                )
-            else:
-                duration = "-"
+        cost = f"${step.cost:.4f}" if step.cost > 0 else "-"
+        attempt = "-" if step.attempt == 0 else f"{step.attempt}/{step.retries + 1}"
+        cells = [
+            f"{prefix}{step.name}",
+            attempt,
+            step.model,
+            _format_context(step.context_tokens, step.compaction_count),
+            duration,
+            cost,
+        ]
+        return cells, row_style
 
-            if isinstance(step, DynamicWorkflowStep):
-                cost = "-"
-                model = "-"
-                attempt = "-"
-            else:
-                # Format cost
-                cost = f"${step.cost:.4f}" if step.cost > 0 else "-"
-                model = step.model
-                if step.attempt == 0:
-                    attempt = "-"
-                else:
-                    attempt = f"{step.attempt}/{step.retries + 1}"
+    def _substep_row_cells(self, sub: SubStep, depth: int) -> list[str]:
+        """Cells for an in-call (live) substep row in the compact view."""
+        elapsed = sub.accumulated_duration
+        if sub.current_call_start is not None:
+            elapsed += (datetime.now() - sub.current_call_start).total_seconds()
+        suffix = f" ×{sub.invocation_count}" if sub.invocation_count > 1 else ""
+        return [
+            f"{'  ' * depth}└─ ▶ {sub.name}{suffix}",
+            "",
+            sub.model,
+            _format_context(sub.context_tokens, sub.compaction_count),
+            _format_duration(elapsed) if elapsed > 0 else "-",
+            f"${sub.cost:.4f}" if sub.cost > 0 else "-",
+        ]
 
-                # print failed attempts (with their substeps) first
-                for i, failed_attempt in enumerate(step.failed_attempts):
-                    table.add_row(
-                        f"✗ {step.name}",
-                        f"{i + 1}/{step.retries + 1}",
-                        model,
-                        "",
-                        _format_duration((failed_attempt.end_time - failed_attempt.start_time).total_seconds()),
-                        f"${failed_attempt.cost:.4f}",
-                        style="dim red",
-                    )
-                    # substeps that belonged to this failed attempt (stale)
-                    for sub in failed_attempt.substeps:
-                        self._render_substep_tree(table, sub, parent_status="failed", stale=True)
-
-            table.add_row(step_name, attempt, model, _format_context(step.context_tokens, step.compaction_count), duration, cost, style=row_style)
-
-            # current-attempt substeps (status mirrors parent)
-            if isinstance(step, WorkflowStep):
-                for sub in step.substeps:
-                    self._render_substep_tree(table, sub, parent_status=step.status, stale=False)
-
-        # Add total row
-        total_cost = sum(
-            step.cost
-            + sum(f.cost + _tree_cost(f.substeps) for f in step.failed_attempts)
-            + _tree_cost(step.substeps)
-            for step in self.steps if isinstance(step, WorkflowStep)
-        )
-
+    def _add_total_row(self, table: Table) -> None:
         table.add_section()
         table.add_row(
-            "Total",
-            "",
-            "",
-            "",
-            f"{_format_duration(self._elapsed_seconds())}",
-            f"${total_cost:.4f}",
+            "Total", "", "", "",
+            _format_duration(self._elapsed_seconds()),
+            f"${self.cumulative_cost:.4f}",
             style="bold",
         )
 
-        # Write rendered status to log file only when status changes (not time)
+    def _build_full_table(self) -> Table:
+        """The complete table (every step, every substep) — written to steps.log."""
+        table = self._make_status_table()
+        for step in self.steps:
+            if not isinstance(step, WorkflowStep):
+                continue
+            for i, failed_attempt in enumerate(step.failed_attempts):
+                table.add_row(
+                    f"✗ {step.name}",
+                    f"{i + 1}/{step.retries + 1}",
+                    step.model, "",
+                    _format_duration((failed_attempt.end_time - failed_attempt.start_time).total_seconds()),
+                    f"${failed_attempt.cost:.4f}",
+                    style="dim red",
+                )
+                for sub in failed_attempt.substeps:
+                    self._render_substep_tree(table, sub, parent_status="failed", stale=True)
+            cells, row_style = self._step_row(step)
+            table.add_row(*cells, style=row_style)
+            for sub in step.substeps:
+                self._render_substep_tree(table, sub, parent_status=step.status, stale=False)
+        self._add_total_row(table)
+        return table
+
+    @staticmethod
+    def _counts_summary(counts: dict[str, int]) -> str:
+        parts = [
+            f"{glyph}{counts[status]}"
+            for status, glyph in (
+                ("completed", "✓"), ("running", "⟳"), ("pending", "⋯"),
+                ("failed", "✗"), ("skipped", "○"),
+            )
+            if counts.get(status)
+        ]
+        return "   ".join(parts) or "no steps"
+
+    def _render_frontier(self, table: Table, step: WorkflowStep, budget: int) -> int:
+        """Render a running step's live (in-call) subagents, up to `budget` rows;
+        collapse everything else into one summary row. Returns rows added."""
+        total = _count_subagents(step.substeps)
+        if total == 0 or budget <= 0:
+            return 0
+        in_call = _collect_in_call(step.substeps)
+        used = 0
+        for depth, sub in in_call[: max(0, budget - 1)]:  # leave a row for the summary
+            table.add_row(*self._substep_row_cells(sub, depth), style="bright_yellow")
+            used += 1
+        unshown_live = len(in_call) - used
+        done = total - len(in_call)
+        remaining = unshown_live + done
+        if remaining > 0 and used < budget:
+            label = (
+                f"    └─ +{remaining} more ({done} done)" if unshown_live
+                else f"    └─ +{done} subagents done"
+            )
+            table.add_row(label, "", "", "", "", "", style="dim")
+            used += 1
+        return used
+
+    def _build_compact_table(self) -> Table:
+        """Auto-fitting 'live frontier' view: status summary + failed + running
+        (showing only each step's in-call subagents, the rest counted) + pinned
+        Total. Sized to the terminal so it never overflows; full detail in steps.log.
+        """
+        table = self._make_status_table()
+
+        height = self.console.size.height or 40
+        # reserve: borders(2) header(1) summary(1) section+total(2) subtitle(1)
+        # safety(1) + 1 extra so the top border survives a terminal overlay
+        budget = max(4, height - 9)
+
+        wf_steps = [s for s in self.steps if isinstance(s, WorkflowStep)]
+        counts: dict[str, int] = {}
+        for s in wf_steps:
+            counts[s.status] = counts.get(s.status, 0) + 1
+        running = [s for s in wf_steps if s.status == "running"]
+        failed = [s for s in wf_steps if s.status == "failed"]
+
+        table.add_row(self._counts_summary(counts), "", "", "", "", "", style="bold dim")
+        rows_left = budget
+
+        # Failed steps (no substeps) — surfaced first.
+        hidden_failed = 0
+        for s in failed:
+            if rows_left <= 1 and running:
+                hidden_failed += 1
+                continue
+            cells, _ = self._step_row(s)
+            table.add_row(*cells, style="red")
+            rows_left -= 1
+        if hidden_failed:
+            table.add_row(f"  ✗ +{hidden_failed} more failed (see steps.log)", "", "", "", "", "", style="dim red")
+            rows_left -= 1
+
+        # Running steps with fair-share live frontier.
+        hidden_running = 0
+        n = len(running)
+        for i, s in enumerate(running):
+            if rows_left <= 0:
+                hidden_running = n - i
+                break
+            cells, style = self._step_row(s)
+            table.add_row(*cells, style=style)
+            rows_left -= 1
+            remaining_steps = n - i
+            slice_budget = rows_left // remaining_steps if remaining_steps else 0
+            rows_left -= self._render_frontier(table, s, slice_budget)
+        if hidden_running:
+            table.add_row(f"  ⟳ +{hidden_running} more running (see steps.log)", "", "", "", "", "", style="dim cyan")
+            rows_left -= 1
+
+        # Pending count, if room.
+        if counts.get("pending") and rows_left > 0:
+            table.add_row(f"  ⋯ {counts['pending']} pending", "", "", "", "", "", style="dim")
+
+        self._add_total_row(table)
+        return table
+
+    def _get_status_display(self) -> Panel:
+        """Compact 'live frontier' panel for the screen; the full table goes to steps.log."""
+        # Write the FULL table to the log only when status changes (not on time ticks).
         current_snapshot = tuple(
             (
                 step.name,
@@ -1239,18 +1337,17 @@ class AIWorkflow(ABC):
             )
             for step in self.steps
         )
-
         if current_snapshot != self._last_status_snapshot:
             buffer = StringIO()
-            log_console = Console(file=buffer, force_terminal=False)
-            log_console.print(table)
+            # Wide, fixed width so the full table renders without compression/cropping.
+            log_console = Console(file=buffer, force_terminal=False, width=200)
+            log_console.print(self._build_full_table())
             with open(self.steps_log_file, "w") as f:
                 f.write(buffer.getvalue())
             self._last_status_snapshot = current_snapshot
 
-        # Title shows live concurrency (running/cap) and pause state; subtitle
-        # lists the interactive controls. status_title (e.g. beast's progress %)
-        # is preserved, never clobbered.
+        # Title shows live concurrency (running/cap) and pause state; subtitle lists
+        # controls. status_title (e.g. beast's progress %) is preserved, never clobbered.
         running_n = self._running_workflow_steps()
         limit = self._max_parallel_steps
         par = f"∥ {running_n}/{'∞' if limit is None else limit}"
@@ -1265,8 +1362,9 @@ class AIWorkflow(ABC):
         else:
             title = base
             border = "blue"
+
         return Panel(
-            table,
+            self._build_compact_table(),
             title=title,
             subtitle="SPACE pause   ↑/↓ parallel",
             subtitle_align="right",
