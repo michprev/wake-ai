@@ -110,7 +110,7 @@ class ClaudeSession(SessionABC):
     fork_session: str | ClaudeSession | None
     tools: list[FunctionTool]
     env: dict[str, str]
-    effort: Literal["low", "medium", "high", "max"] | None
+    effort: Literal["low", "medium", "high", "xhigh", "max"] | None
     turn_step: int | None
     sandbox: bool
     shell_network_access: bool
@@ -132,7 +132,7 @@ class ClaudeSession(SessionABC):
         fork_session: str | ClaudeSession | None = None,
         tools: list[FunctionTool] | None = None,
         env: dict[str, str] | None = None,
-        effort: Literal["low", "medium", "high", "max"] | None = None,
+        effort: Literal["low", "medium", "high", "xhigh", "max"] | None = None,
         turn_step: int | None = None,
         sandbox: bool = True,
         shell_network_access: bool = False,
