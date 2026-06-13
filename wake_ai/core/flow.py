@@ -2,15 +2,18 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 import asyncio
-from contextlib import nullcontext
+from contextlib import nullcontext, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime
 from functools import wraps
 from io import StringIO
+import os
 from pathlib import Path
 import re
 import shutil
+import signal
+import sys
 from typing import Any, Awaitable, Literal, Callable, Coroutine, TypeVar, Generic, cast
 
 import jinja2
@@ -568,6 +571,22 @@ class AIWorkflow(ABC):
         self._init_called = True
         self._last_status_snapshot = None
 
+        # Pause/resume gate. Set = workflow may launch new steps; cleared = paused.
+        # Pausing withholds only NEW launches — in-flight steps run to completion,
+        # so pausing never interrupts a step mid-flight, and never triggers a retry
+        # or from-scratch restart. Toggle via toggle_pause() (spacebar / SIGUSR1).
+        self._run_gate = asyncio.Event()
+        self._run_gate.set()
+
+        # Live-adjustable cap on concurrently running WorkflowSteps (None = unlimited).
+        # Seeded from execute(max_parallel_steps=...); changed mid-run via ↑/↓ keys.
+        self._max_parallel_steps: int | None = None
+
+        # Total-time clock pausing: cumulative seconds spent fully paused (idle),
+        # plus the start of the current idle interval (None when not idle).
+        self._paused_accumulated: float = 0.0
+        self._quiescent_since: datetime | None = None
+
     @property
     def cumulative_cost(self) -> float:
         return sum(
@@ -576,6 +595,117 @@ class AIWorkflow(ABC):
             + _tree_cost(step.substeps)
             for step in self.steps if isinstance(step, WorkflowStep)
         )
+
+    @property
+    def is_paused(self) -> bool:
+        """True when paused — no new steps will be launched (in-flight ones drain)."""
+        return not self._run_gate.is_set()
+
+    def toggle_pause(self) -> None:
+        """Flip pause state. Safe from a keypress/signal handler. Drains, never cancels.
+
+        Pausing lets in-flight steps finish; it does not cancel or retry them.
+        Resuming relaunches whatever was withheld.
+        """
+        if self._run_gate.is_set():
+            self._run_gate.clear()
+            if not self.show_progress:
+                self.console.print("[yellow]⏸ Pausing — finishing in-flight steps…[/yellow]")
+        else:
+            self._run_gate.set()
+            if not self.show_progress:
+                self.console.print("[green]▶ Resuming[/green]")
+
+    def _running_workflow_steps(self) -> int:
+        return sum(
+            1 for s in self.steps
+            if isinstance(s, WorkflowStep) and s.status == "running"
+        )
+
+    def _elapsed_seconds(self) -> float:
+        """Wall-clock since start, minus time spent fully paused (idle).
+
+        Draining (paused with steps still running) keeps counting — real work is
+        happening; only the quiescent PAUSED state freezes the clock.
+        """
+        elapsed = (datetime.now() - self.start_time).total_seconds() - self._paused_accumulated
+        if self._quiescent_since is not None:
+            elapsed -= (datetime.now() - self._quiescent_since).total_seconds()
+        return max(0.0, elapsed)
+
+    def adjust_parallelism(self, delta: int) -> None:
+        """Raise/lower the concurrent-step cap mid-run. Safe from a key handler.
+
+        Lowering only stops NEW launches — already-running steps are never
+        cancelled, so concurrency drains down to the new cap. From unlimited, a
+        decrease first snaps to the current concurrency, then steps down.
+        """
+        cur = self._max_parallel_steps
+        if cur is None:
+            if delta >= 0:
+                return  # already unlimited
+            cur = max(self._running_workflow_steps(), 1)
+        self._max_parallel_steps = max(1, cur + delta)
+        if not self.show_progress:
+            self.console.print(f"[cyan]∥ max parallel steps → {self._max_parallel_steps}[/cyan]")
+
+    def _install_pause_controls(self) -> Callable[[], None]:
+        """Wire spacebar (interactive TTY) and SIGUSR1 to toggle_pause; return a cleanup fn.
+
+        No-ops gracefully when stdin isn't a TTY (piped/headless/Docker) or the
+        platform lacks termios/SIGUSR1. SIGUSR1 still works headless:
+        ``kill -USR1 <pid>`` toggles pause.
+        """
+        cleanups: list[Callable[[], None]] = []
+        loop = asyncio.get_running_loop()
+
+        # Spacebar on an interactive TTY.
+        try:
+            if sys.stdin is not None and sys.stdin.isatty():
+                import termios
+                import tty
+
+                fd = sys.stdin.fileno()
+                old_attrs = termios.tcgetattr(fd)
+                tty.setcbreak(fd)  # ICANON+ECHO off; ISIG stays on so Ctrl+C still works
+
+                def _on_key() -> None:
+                    try:
+                        data = os.read(fd, 8)  # an arrow key is a 3-byte escape sequence
+                    except Exception:
+                        return
+                    if data == b" ":
+                        self.toggle_pause()
+                    elif data in (b"\x1b[A", b"\x1bOA"):  # Up
+                        self.adjust_parallelism(+1)
+                    elif data in (b"\x1b[B", b"\x1bOB"):  # Down
+                        self.adjust_parallelism(-1)
+
+                loop.add_reader(fd, _on_key)
+
+                def _restore_tty() -> None:
+                    with suppress(Exception):
+                        loop.remove_reader(fd)
+                    with suppress(Exception):
+                        termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
+
+                cleanups.append(_restore_tty)
+        except Exception:
+            pass
+
+        # SIGUSR1 for headless toggling (e.g. the dockerized beast-run service).
+        try:
+            loop.add_signal_handler(signal.SIGUSR1, self.toggle_pause)
+            cleanups.append(lambda: loop.remove_signal_handler(signal.SIGUSR1))
+        except (NotImplementedError, AttributeError, ValueError):
+            pass
+
+        def _cleanup() -> None:
+            for fn in cleanups:
+                with suppress(Exception):
+                    fn()
+
+        return _cleanup
 
     @require_initialized
     def add_step(
@@ -784,6 +914,8 @@ class AIWorkflow(ABC):
         max_parallel_steps: int | None = None,
     ) -> AIResult:
         try:
+            self._max_parallel_steps = max_parallel_steps
+            key_cleanup = self._install_pause_controls()
             running: dict[asyncio.Task, WorkflowStep | DynamicWorkflowStep[Any]] = {}
 
             self.start_time = datetime.now()
@@ -799,12 +931,27 @@ class AIWorkflow(ABC):
 
             with ctx as live:
                 while any(step.status in ["pending", "running"] for step in self.steps):
-                    # Start all ready steps that can run
+                    # Freeze the total-time clock once fully quiescent (paused with
+                    # no running step). Draining (paused, steps still finishing)
+                    # keeps ticking. Once paused, no new steps launch, so the
+                    # running count only falls — the idle interval runs until resume.
+                    if self.is_paused and self._running_workflow_steps() == 0:
+                        if self._quiescent_since is None:
+                            self._quiescent_since = datetime.now()
+                    elif self._quiescent_since is not None:
+                        self._paused_accumulated += (datetime.now() - self._quiescent_since).total_seconds()
+                        self._quiescent_since = None
+
+                    # Start all ready steps that can run (withheld while paused;
+                    # in-flight steps still drain to completion below).
                     for step in list(self.steps):
-                        # only count WorkflowSteps
+                        if not self._run_gate.is_set():
+                            break
+                        # only count WorkflowSteps; read the live (mutable) cap
+                        limit = self._max_parallel_steps
                         if (
-                            max_parallel_steps is not None
-                            and len([s for s in running.values() if isinstance(s, WorkflowStep)]) >= max_parallel_steps
+                            limit is not None
+                            and len([s for s in running.values() if isinstance(s, WorkflowStep)]) >= limit
                         ):
                             break
 
@@ -840,6 +987,16 @@ class AIWorkflow(ABC):
                                     dynamic_step = cast(DynamicWorkflowStep[Any], step)
                                     task = asyncio.create_task(dynamic_step.handler(dynamic_step))
                                 running[task] = step
+
+                    if not running:
+                        # Nothing in flight. If paused, this is the quiescent
+                        # "safe to suspend/kill" state — park until resumed.
+                        # Otherwise yield briefly (nothing launchable this tick).
+                        if not self._run_gate.is_set():
+                            await self._run_gate.wait()
+                        else:
+                            await asyncio.sleep(0.05)
+                        continue
 
                     # dynamic steps may produce new children steps at runtime and wait for them to complete
                     done, _ = await asyncio.wait(running.keys(), timeout=1, return_when=asyncio.FIRST_COMPLETED)
@@ -896,6 +1053,8 @@ class AIWorkflow(ABC):
 
             return self.collect_result()
         finally:
+            with suppress(Exception):
+                key_cleanup()
             self.console.print(self._get_status_display())
 
             if self.cleanup_working_dir and self.working_dir.exists():
@@ -1059,7 +1218,7 @@ class AIWorkflow(ABC):
             "",
             "",
             "",
-            f"{_format_duration((datetime.now() - self.start_time).total_seconds())}",
+            f"{_format_duration(self._elapsed_seconds())}",
             f"${total_cost:.4f}",
             style="bold",
         )
@@ -1089,5 +1248,27 @@ class AIWorkflow(ABC):
                 f.write(buffer.getvalue())
             self._last_status_snapshot = current_snapshot
 
-        # Return panel with table and status
-        return Panel(table, title=self.status_title, border_style="blue")
+        # Title shows live concurrency (running/cap) and pause state; subtitle
+        # lists the interactive controls. status_title (e.g. beast's progress %)
+        # is preserved, never clobbered.
+        running_n = self._running_workflow_steps()
+        limit = self._max_parallel_steps
+        par = f"∥ {running_n}/{'∞' if limit is None else limit}"
+        base = f"{self.status_title}  │  {par}" if self.status_title else par
+        if self.is_paused:
+            note = (
+                "⏸ DRAINING — finishing in-flight steps…" if running_n
+                else "⏸ PAUSED — safe to suspend or kill"
+            )
+            title = f"{note}  │  {base}"
+            border = "yellow"
+        else:
+            title = base
+            border = "blue"
+        return Panel(
+            table,
+            title=title,
+            subtitle="SPACE pause   ↑/↓ parallel",
+            subtitle_align="right",
+            border_style=border,
+        )
