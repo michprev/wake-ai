@@ -26,14 +26,22 @@ async def run_under_landlock(command: str, network_access: bool, writable_roots:
     assert proc.stdout is not None
     assert proc.stderr is not None
 
+    # communicate() drains stdout/stderr concurrently while waiting. Using
+    # proc.wait() with PIPEd output deadlocks once the child fills the OS pipe
+    # buffer (~64 KiB): it blocks on write(), never exits, and we hit `timeout`.
     try:
-        await asyncio.wait_for(proc.wait(), timeout=timeout)
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except asyncio.TimeoutError:
         proc.terminate()
+        # Reap the process (and drain pipes) so it doesn't linger; kill if it
+        # ignores SIGTERM.
+        try:
+            await asyncio.wait_for(proc.communicate(), timeout=5)
+        except asyncio.TimeoutError:
+            proc.kill()
         raise
 
-    stdout = await proc.stdout.read()
-    stderr = await proc.stderr.read()
     returncode = proc.returncode
+    assert returncode is not None  # set once communicate() returns normally
 
     return stdout.decode("utf-8"), stderr.decode("utf-8"), returncode
