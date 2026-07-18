@@ -1,17 +1,26 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
+import os
+import tempfile
 from copy import deepcopy
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import AsyncIterator, Generator, TypedDict, Any, NamedTuple, Literal
 
 from .codex_pricing import CodexTokenPricing, GPT_PRICING
-from .session_abc import SessionABC
+from .session_abc import SessionABC, FunctionTool
 from .verbose_formatter import VerboseFormatter
 from ..utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+# Reserved MCP server name under which in-process Python `tools` are exposed to codex.
+_TOOLS_MCP_SERVER_NAME = "local_tools"
+# Generous startup timeout so codex-side MCP init doesn't miss the server under load.
+_TOOLS_MCP_STARTUP_TIMEOUT_SEC = 120
 
 
 TERMINATION_PROMPT = (
@@ -54,47 +63,101 @@ def _compute_cost(
         return cost
 
 
+def _context_tokens(usage: SimpleTotalTokenUsage | TieredTotalTokenUsage) -> int:
+    """Input tokens of the latest turn ≈ current context size."""
+    if "input_tokens" in usage:
+        return usage["input_tokens"]
+    return sum(usage[tier]["input_tokens"] for tier in ("flex", "standard", "priority") if tier in usage)
+
+
 class CodexResponse(NamedTuple):
     cost: float
     status: Literal["running", "terminating_on_max_cost", "succeeded", "terminated", "errored"]
+    final_message: str | None = None
+    context_tokens: int | None = None  # input tokens of the latest turn ≈ current context size
+    compaction_count: int = 0
+
+
+@dataclass
+class StdioMcpServer:
+    """A stdio-transport MCP server, passed to codex per-invocation (no config file)."""
+    command: str
+    args: list[str] = field(default_factory=list)
+    env: dict[str, str] | None = None
+
+
+@dataclass
+class StreamableHttpMcpServer:
+    """A streamable-HTTP-transport MCP server, passed to codex per-invocation (no config file)."""
+    url: str
+    bearer_token_env_var: str | None = None
+    http_headers: dict[str, str] | None = None
+    env_http_headers: dict[str, str] | None = None
+
+
+McpServer = StdioMcpServer | StreamableHttpMcpServer
 
 
 class CodexSession(SessionABC):
     execution_dir: Path
     _session_id: str | None
-    fork_session: str | CodexSession | None
     reasoning_effort: str
     models_pricing: dict[str, dict[Literal["flex", "standard", "priority"], CodexTokenPricing]] | None
-    service_tier: Literal["flex", "standard", "priority"] | None
+    instructions: str | None
+    reasoning_summary: Literal["auto", "concise", "detailed", "none"] | None
+    output_verbosity: Literal["low", "medium", "high"] | None
+    web_search: bool
+    web_search_context_size: Literal["low", "medium", "high"] | None
+    tools: list[FunctionTool]
+    mcps: dict[str, McpServer]
+    mcp_call_timeout: float | None
     sandbox_mode: Literal["read-only", "workspace-write", "danger-full-access"]
+    bypass_sandbox: bool
+    shell_network_access: bool
     codex_executable: str
     additional_options: dict[str, Any]
 
     token_usage: TieredTotalTokenUsage
+    _last_message: str | None
+    _instructions_file: str | None
+    _tools_mcp_url: str | None
 
     def __init__(
         self,
         execution_dir: Path,
         *,
         session_id: str | None = None,
-        fork_session: str | CodexSession | None = None,
         reasoning_effort: str = "high",
+        reasoning_summary: Literal["auto", "concise", "detailed", "none"] | None = None,
+        output_verbosity: Literal["low", "medium", "high"] | None = None,
         models_pricing: dict[str, dict[Literal["flex", "standard", "priority"], CodexTokenPricing]] | None = None,
-        service_tier: Literal["flex", "standard", "priority"] | None = None,
+        instructions: str | None = None,
+        web_search: bool = False,
+        web_search_context_size: Literal["low", "medium", "high"] | None = None,
+        tools: list[FunctionTool] | None = None,
+        mcps: dict[str, McpServer] | None = None,
+        mcp_call_timeout: float | None = None,
         sandbox_mode: Literal["read-only", "workspace-write", "danger-full-access"] = "workspace-write",
+        bypass_sandbox: bool = False,
+        shell_network_access: bool = False,
         codex_executable: str = "codex",
         additional_options: dict[str, Any] | None = None,
     ):
-        if session_id is not None and fork_session is not None:
-            raise ValueError("session_id and fork_session cannot be used together")
-
         self.execution_dir = execution_dir
         self._session_id = session_id
-        self.fork_session = fork_session
         self.reasoning_effort = reasoning_effort
+        self.reasoning_summary = reasoning_summary
+        self.output_verbosity = output_verbosity
         self.models_pricing = models_pricing
-        self.service_tier = service_tier
+        self.instructions = instructions
+        self.web_search = web_search
+        self.web_search_context_size = web_search_context_size
+        self.tools = list(tools) if tools is not None else []
+        self.mcps = mcps or {}
+        self.mcp_call_timeout = mcp_call_timeout
         self.sandbox_mode = sandbox_mode
+        self.bypass_sandbox = bypass_sandbox
+        self.shell_network_access = shell_network_access
         self.codex_executable = codex_executable
         self.additional_options = additional_options or {}
 
@@ -103,6 +166,9 @@ class CodexSession(SessionABC):
             standard=SimpleTotalTokenUsage(input_tokens=0, cached_input_tokens=0, output_tokens=0),
             priority=SimpleTotalTokenUsage(input_tokens=0, cached_input_tokens=0, output_tokens=0),
         )
+        self._last_message = None
+        self._instructions_file = None
+        self._tools_mcp_url = None
 
     @property
     def session_id(self) -> str | None:
@@ -119,12 +185,18 @@ class CodexSession(SessionABC):
                 self.token_usage[tier]["cached_input_tokens"] = usage[tier]["cached_input_tokens"] + initial_usage[tier]["cached_input_tokens"]
                 self.token_usage[tier]["output_tokens"] = usage[tier]["output_tokens"] + initial_usage[tier]["output_tokens"]
 
+    def _write_instructions_file(self) -> str:
+        """Write the system prompt to a temp file for codex's `model_instructions_file` config (once)."""
+        if self._instructions_file is None:
+            assert self.instructions is not None
+            fd, path = tempfile.mkstemp(prefix="codex_instructions_", suffix=".md")
+            with os.fdopen(fd, "w") as f:
+                f.write(self.instructions)
+            self._instructions_file = path
+        return self._instructions_file
+
     async def _setup_process(self, prompt: str, model: str, formatter: VerboseFormatter) -> asyncio.subprocess.Process:
         args = [self.codex_executable, "exec", "--json"]
-
-        if self.service_tier is not None:
-            args.append("--service-tier")
-            args.append(self.service_tier)
 
         args.append("--model")
         args.append(model)
@@ -136,11 +208,93 @@ class CodexSession(SessionABC):
 
         args.append("--skip-git-repo-check")
 
-        args.append("--sandbox")
-        args.append(self.sandbox_mode)
+        if self.bypass_sandbox:
+            # For sessions already wrapped in an external sandbox (e.g. beast's nested
+            # sandbox) or when bwrap is unavailable: skip codex's own sandboxing.
+            # (Full access already includes network.)
+            args.append("--dangerously-bypass-approvals-and-sandbox")
+        else:
+            args.append("--sandbox")
+            args.append(self.sandbox_mode)
+            # Grant network to shell commands under the workspace-write sandbox
+            # (has no effect under read-only).
+            if self.shell_network_access:
+                args.append("-c")
+                args.append("sandbox_workspace_write.network_access=true")
 
         args.append("-c")
         args.append(f'model_reasoning_effort="{self.reasoning_effort}"')
+
+        if self.reasoning_summary is not None:
+            args.append("-c")
+            args.append(f"model_reasoning_summary={json.dumps(self.reasoning_summary)}")
+
+        if self.output_verbosity is not None:
+            args.append("-c")
+            args.append(f"model_verbosity={json.dumps(self.output_verbosity)}")
+
+        if self.instructions is not None:
+            args.append("-c")
+            args.append(f'model_instructions_file="{self._write_instructions_file()}"')
+
+        if self.web_search:
+            args.append("-c")
+            args.append("tools_web_search_request=true")
+            if self.web_search_context_size is not None:
+                args.append("-c")
+                args.append(f"web_search_config.search_context_size={json.dumps(self.web_search_context_size)}")
+
+        # MCP servers are passed per-invocation as `-c mcp_servers.<name>.*` overrides
+        # (not via a config file) so each session can carry its own toolset. Values are
+        # JSON-encoded, which is valid TOML for the scalar/array cases; maps (env, headers)
+        # are emitted as dotted sub-keys. codex infers the transport from the fields present
+        # (`command` -> stdio, `url` -> streamable_http).
+        for name, server in self.mcps.items():
+            prefix = f"mcp_servers.{name}"
+            if isinstance(server, StdioMcpServer):
+                args.append("-c")
+                args.append(f"{prefix}.command={json.dumps(server.command)}")
+                if server.args:
+                    args.append("-c")
+                    args.append(f"{prefix}.args={json.dumps(server.args)}")
+                for k, v in (server.env or {}).items():
+                    args.append("-c")
+                    args.append(f"{prefix}.env.{k}={json.dumps(v)}")
+            elif isinstance(server, StreamableHttpMcpServer):
+                args.append("-c")
+                args.append(f"{prefix}.url={json.dumps(server.url)}")
+                if server.bearer_token_env_var is not None:
+                    args.append("-c")
+                    args.append(f"{prefix}.bearer_token_env_var={json.dumps(server.bearer_token_env_var)}")
+                for k, v in (server.http_headers or {}).items():
+                    args.append("-c")
+                    args.append(f"{prefix}.http_headers.{k}={json.dumps(v)}")
+                for k, v in (server.env_http_headers or {}).items():
+                    args.append("-c")
+                    args.append(f"{prefix}.env_http_headers.{k}={json.dumps(v)}")
+            else:
+                raise TypeError(f"Unsupported MCP server type for CodexSession: {type(server)}")
+
+            if self.mcp_call_timeout is not None:
+                args.append("-c")
+                args.append(f"{prefix}.tool_timeout_sec={json.dumps(self.mcp_call_timeout)}")
+
+        # In-process Python `tools` are exposed via a streamable-HTTP MCP server
+        # started for the duration of the query (see `query`). `required` makes codex
+        # exit with an error (rather than silently dropping the tools) if it can't
+        # initialize the server, so failures surface loudly and retry; a generous
+        # startup timeout guards against codex-side init timing under load.
+        if self._tools_mcp_url is not None:
+            prefix = f"mcp_servers.{_TOOLS_MCP_SERVER_NAME}"
+            args.append("-c")
+            args.append(f"{prefix}.url={json.dumps(self._tools_mcp_url)}")
+            args.append("-c")
+            args.append(f"{prefix}.required=true")
+            args.append("-c")
+            args.append(f"{prefix}.startup_timeout_sec={_TOOLS_MCP_STARTUP_TIMEOUT_SEC}")
+            if self.mcp_call_timeout is not None:
+                args.append("-c")
+                args.append(f"{prefix}.tool_timeout_sec={json.dumps(self.mcp_call_timeout)}")
 
         for key, value in self.additional_options.items():
             args.append("-c")
@@ -154,17 +308,6 @@ class CodexSession(SessionABC):
         if self._session_id is not None:
             args.append("resume")
             args.append(self._session_id)
-        elif self.fork_session is not None:
-            args.append("resume")
-
-            if isinstance(self.fork_session, str):
-                args.append(self.fork_session)
-            else:
-                if self.fork_session._session_id is None:
-                    raise RuntimeError("Forking from CodexSession without assigned session id")
-                args.append(self.fork_session._session_id)
-
-            args.append("--fork")
 
         formatter.print_system_message(f"Running {' '.join(args)}")
 
@@ -300,6 +443,7 @@ class CodexSession(SessionABC):
                 logger.warning(f"Unexpected Codex item.updated message: {msg}")
         elif msg["type"] == "item.completed":
             if msg["item"]["type"] == "agent_message":
+                self._last_message = msg["item"]["text"]
                 formatter.print_agent_message(msg["item"]["text"])
             elif msg["item"]["type"] == "reasoning":
                 formatter.print_thinking(msg["item"]["text"])
@@ -361,61 +505,80 @@ class CodexSession(SessionABC):
             raise ValueError(f"No pricing found for model '{model}'. Please provide models_pricing.")
 
         initial_token_usage = deepcopy(self.token_usage)
+        self._last_message = None
 
-        # each launched process starts counting tokens from the beginning
-        # (even if we continue an existing session)
-        proc = await self._setup_process(prompt, model, formatter)
+        # Expose in-process Python `tools` to codex via a short-lived HTTP MCP server.
+        # Handlers run in the context captured here so context-vars (e.g. the flow
+        # engine's current-host, enabling nested subagents) propagate into them.
+        tools_server = None
+        if self.tools:
+            from .codex_tools import InProcessToolsServer
+            tools_server = InProcessToolsServer(self.tools, name=_TOOLS_MCP_SERVER_NAME)
+            tools_server.set_context(contextvars.copy_context())
+            self._tools_mcp_url = await tools_server.start()
 
-        if "experimental_instructions_file" in self.additional_options:
-            instructions = Path(self.additional_options["experimental_instructions_file"]).read_text()
-            formatter.print_system_message(f"Custom instructions:\n{instructions}")
+        try:
+            # each launched process starts counting tokens from the beginning
+            # (even if we continue an existing session)
+            proc = await self._setup_process(prompt, model, formatter)
 
-        formatter.print_user_message(prompt)
-        terminated = False
-        cost = 0.0
+            if self.instructions is not None:
+                formatter.print_system_message(f"Custom instructions:\n{self.instructions}")
 
-        async for msg in self._receive_messages(proc):
-            self._process_message(msg, formatter)
-
-            if msg["type"] == "turn.completed":
-                self._update_token_usage(msg["usage"], initial_token_usage)
-                cost = _compute_cost(
-                    msg["usage"],
-                    model_pricing,
-                )
-                yield CodexResponse(cost=cost, status="running")
-
-                if max_cost is not None and cost > max_cost:
-                    proc.terminate()
-                    terminated = True
-
-        assert self._session_id is not None
-
-        main_cost = cost
-        cost = 0.0
-
-        await proc.wait()
-
-        if terminated:
-            formatter.print_user_message(TERMINATION_PROMPT)
-            proc = await self._setup_process(TERMINATION_PROMPT, model, formatter)
+            formatter.print_user_message(prompt)
+            terminated = False
+            cost = 0.0
+            context_tokens: int | None = None
 
             async for msg in self._receive_messages(proc):
                 self._process_message(msg, formatter)
 
                 if msg["type"] == "turn.completed":
                     self._update_token_usage(msg["usage"], initial_token_usage)
+                    context_tokens = _context_tokens(msg["usage"])
                     cost = _compute_cost(
                         msg["usage"],
                         model_pricing,
                     )
-                    yield CodexResponse(cost=main_cost + cost, status="terminating_on_max_cost")
+                    yield CodexResponse(cost=cost, status="running", final_message=self._last_message, context_tokens=context_tokens)
 
-        yield CodexResponse(cost=main_cost + cost, status="succeeded")
+                    if max_cost is not None and cost > max_cost:
+                        proc.terminate()
+                        terminated = True
+
+            assert self._session_id is not None
+
+            main_cost = cost
+            cost = 0.0
+
+            await proc.wait()
+
+            if terminated:
+                formatter.print_user_message(TERMINATION_PROMPT)
+                proc = await self._setup_process(TERMINATION_PROMPT, model, formatter)
+
+                async for msg in self._receive_messages(proc):
+                    self._process_message(msg, formatter)
+
+                    if msg["type"] == "turn.completed":
+                        self._update_token_usage(msg["usage"], initial_token_usage)
+                        context_tokens = _context_tokens(msg["usage"])
+                        cost = _compute_cost(
+                            msg["usage"],
+                            model_pricing,
+                        )
+                        yield CodexResponse(cost=main_cost + cost, status="terminating_on_max_cost", final_message=self._last_message, context_tokens=context_tokens)
+
+            yield CodexResponse(cost=main_cost + cost, status="succeeded", final_message=self._last_message, context_tokens=context_tokens)
+        finally:
+            self._tools_mcp_url = None
+            if tools_server is not None:
+                await tools_server.stop()
 
     def reset(self) -> None:
         """
         Reset the session ID
         """
         self._session_id = None
-        # keep token_usage
+        self._last_message = None
+        # keep token_usage and the instructions temp file
