@@ -6,7 +6,7 @@ from functools import partial
 from pathlib import Path
 from typing import AsyncIterator, NamedTuple, Literal, Callable, Awaitable, Any
 
-from claude_agent_sdk import AgentDefinition, AssistantMessage, ClaudeAgentOptions, ClaudeSDKClient, HookContext, HookInput, HookJSONOutput, HookMatcher, McpServerConfig, Message, ResultMessage, SandboxIgnoreViolations, SandboxNetworkConfig, SandboxSettings, SystemMessage, TaskNotificationMessage, TaskProgressMessage, TaskStartedMessage, TextBlock, ThinkingBlock, ToolResultBlock, ToolUseBlock, UserMessage, create_sdk_mcp_server, SdkMcpTool
+from claude_agent_sdk import AgentDefinition, AssistantMessage, ClaudeAgentOptions, ClaudeSDKClient, HookContext, HookInput, HookJSONOutput, HookMatcher, McpServerConfig, Message, ResultMessage, SandboxIgnoreViolations, SandboxNetworkConfig, SandboxSettings, SystemMessage, TaskNotificationMessage, TaskProgressMessage, TaskStartedMessage, TextBlock, ThinkingBlock, ThinkingConfigAdaptive, ThinkingConfigDisabled, ThinkingConfigEnabled, ToolResultBlock, ToolUseBlock, UserMessage, create_sdk_mcp_server, SdkMcpTool
 from claude_agent_sdk.types import SystemPromptPreset
 
 from .session_abc import SessionABC, FunctionTool
@@ -133,6 +133,7 @@ class ClaudeSession(SessionABC):
         tools: list[FunctionTool] | None = None,
         env: dict[str, str] | None = None,
         effort: Literal["low", "medium", "high", "xhigh", "max"] | None = None,
+        thinking: ThinkingConfigAdaptive | ThinkingConfigEnabled | ThinkingConfigDisabled | None = None,
         turn_step: int | None = None,
         sandbox: bool = True,
         shell_network_access: bool = False,
@@ -180,6 +181,12 @@ class ClaudeSession(SessionABC):
         self.env["CLAUDECODE"] = ""
 
         self.effort = effort
+        # Native thinking config -> forwarded to the CLI as --thinking / --thinking-display.
+        # Prefer this over injecting {"thinking": ...} via CLAUDE_CODE_EXTRA_BODY: the env-body
+        # override forces thinking onto EVERY request (incl. the WebSearch server tool's internal
+        # forced-tool_choice call, which then 400s), whereas this is applied per-call by the CLI
+        # and coexists with web search.
+        self.thinking = thinking
         self.turn_step = turn_step
         self.sandbox = sandbox
         self.shell_network_access = shell_network_access
@@ -338,6 +345,7 @@ class ClaudeSession(SessionABC):
             env=self.env,
             max_buffer_size=10 * 1024 * 1024 * 1024,  # 10GB
             effort=self.effort,
+            thinking=self.thinking,
             skills=[] if self.ignore_skills else None,
             hooks={
                 "PreCompact": [
