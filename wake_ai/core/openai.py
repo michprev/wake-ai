@@ -398,7 +398,7 @@ class OpenAISession(SessionABC):
         if platform.system() not in {"Darwin", "Linux"}:
             raise NotImplementedError("Shell tools are only supported on macOS and Linux")
 
-        timeout = timeout_ms / 1000.0 if timeout_ms is not None else 10 * 60 * 1000
+        timeout = timeout_ms / 1000.0 if timeout_ms is not None else 10 * 60  # seconds (10 min default)
         max_length = max_output_length if max_output_length is not None else 1000000
 
         output: list[ResponseFunctionShellCallOutputContentParam] = []
