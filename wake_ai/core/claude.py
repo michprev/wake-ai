@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import AsyncIterator, NamedTuple, Literal, Callable, Awaitable, Any
 
 from claude_agent_sdk import AgentDefinition, AssistantMessage, ClaudeAgentOptions, ClaudeSDKClient, HookContext, HookInput, HookJSONOutput, HookMatcher, McpServerConfig, Message, ResultMessage, SandboxIgnoreViolations, SandboxNetworkConfig, SandboxSettings, SystemMessage, TaskNotificationMessage, TaskProgressMessage, TaskStartedMessage, TextBlock, ThinkingBlock, ThinkingConfigAdaptive, ThinkingConfigDisabled, ThinkingConfigEnabled, ToolResultBlock, ToolUseBlock, UserMessage, create_sdk_mcp_server, SdkMcpTool
-from claude_agent_sdk.types import SystemPromptPreset
+from claude_agent_sdk.types import HookEvent, SystemPromptPreset
 
 from .session_abc import SessionABC, FunctionTool
 from .verbose_formatter import VerboseFormatter
@@ -52,6 +52,53 @@ DEFAULT_ALLOWED_TOOLS = (
     "Bash(mv:*)",  # Move/rename files
     "Bash(cp:*)",  # Copy files
 )
+
+
+# When the bash sandbox runs with network access, the Claude Code CLI launches an
+# internal HTTP(S)/SOCKS proxy and injects proxy env vars (HTTP_PROXY/HTTPS_PROXY/
+# ALL_PROXY/GIT_SSH_COMMAND/...) into every sandboxed command. That proxy enforces
+# sandbox.network.allowedDomains and refuses any non-allowlisted host; there is no
+# "allow all domains" value (a bare "*" matches nothing), so the only way to reach
+# arbitrary hosts is to bypass the proxy per command. This PreToolUse hook does that
+# centrally, so agents never need to prepend `no_proxy="*"` themselves.
+#
+# `export ...; <cmd>` (not an inline `A=b <cmd>` prefix) is used so the bypass spans
+# the WHOLE command line, including compound commands (`a && b`, pipes, subshells);
+# the inline prefix only covers the first simple command. Reaching the network still
+# requires the OS sandbox to permit the direct socket (shell_network_access=True sets
+# allowLocalBinding); this hook alone does not open the network.
+SANDBOX_PROXY_BYPASS_PREFIX = (
+    "export no_proxy='*' NO_PROXY='*' "
+    "http_proxy='' https_proxy='' HTTP_PROXY='' HTTPS_PROXY='' "
+    "all_proxy='' ALL_PROXY='' GIT_SSH_COMMAND=''; "
+)
+
+
+async def sandbox_proxy_bypass_hook(input: HookInput, tool_use_id: str | None, context: HookContext) -> HookJSONOutput:
+    """PreToolUse hook: transparently prepend the proxy-bypass env to Bash commands.
+
+    Returns ``permissionDecision: "allow"`` alongside ``updatedInput``. This is
+    required, not a broadening: with ``autoAllowBashIfSandboxed`` the CLI already
+    auto-runs any sandboxed command the model writes, but that free pass does NOT
+    survive a hook rewrite -- the rewritten (now multi-operation) command would fall
+    back to the explicit allowlist and be denied. The explicit ``allow`` re-grants
+    exactly what auto-allow was already granting; it does NOT override ``deny`` rules
+    (those still win) and the OS sandbox remains the real boundary.
+    """
+    if input.get("tool_name") != "Bash":
+        return {}
+    tool_input = dict(input.get("tool_input") or {})
+    command = tool_input.get("command", "")
+    if not command or "NO_PROXY='*'" in command:  # idempotent: never rewrite twice
+        return {}
+    tool_input["command"] = SANDBOX_PROXY_BYPASS_PREFIX + command
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "allow",
+            "updatedInput": tool_input,
+        }
+    }
 
 
 class ClaudeResponse(NamedTuple):
@@ -116,6 +163,7 @@ class ClaudeSession(SessionABC):
     shell_network_access: bool
     extra_shell_writable_roots: list[Path | str]
     weaker_nested_sandbox: bool
+    bypass_sandbox_proxy: bool
     ignore_skills: bool
 
     def __init__(
@@ -139,6 +187,7 @@ class ClaudeSession(SessionABC):
         shell_network_access: bool = False,
         extra_shell_writable_roots: list[Path | str] | None = None,
         weaker_nested_sandbox: bool = False,
+        bypass_sandbox_proxy: bool = False,
         ignore_skills: bool = True,
     ):
         if session_id is not None and fork_session is not None:
@@ -192,6 +241,7 @@ class ClaudeSession(SessionABC):
         self.shell_network_access = shell_network_access
         self.extra_shell_writable_roots = extra_shell_writable_roots or []
         self.weaker_nested_sandbox = weaker_nested_sandbox
+        self.bypass_sandbox_proxy = bypass_sandbox_proxy
         self.ignore_skills = ignore_skills
 
     @property
@@ -319,14 +369,47 @@ class ClaudeSession(SessionABC):
             #   the macOS trust daemon to verify certificates; without it they fail
             #   with `x509: OSStatus -26276`.
             # The CLI still injects HTTP(S)/SOCKS proxy env vars (which we cannot
-            # override via `env`) that 403 every non-allowlisted host, so commands
-            # must bypass the proxy per-invocation with `no_proxy='*' NO_PROXY='*'`.
+            # override via `env`) that 403 every non-allowlisted host. There is no
+            # "allow all domains" value, so to reach arbitrary hosts each command must
+            # bypass the proxy with `no_proxy='*' NO_PROXY='*'`. Set
+            # bypass_sandbox_proxy=True to have the sandbox_proxy_bypass_hook do that
+            # automatically instead of instructing agents to prepend it themselves.
             network_config["allowMachLookup"] = ["com.apple.trustd*"]
         else:
             # Any non-None allowedDomains (even []) activates the proxy allowlist; an
             # empty list matches nothing, so all outbound traffic is blocked. Combined
             # with allowLocalBinding=False this leaves no path to the network.
             network_config["allowedDomains"] = []
+
+        hooks: dict[HookEvent, list[HookMatcher]] = {"PreCompact": [HookMatcher(hooks=[pre_compact_hook])]}
+        if self.bypass_sandbox_proxy:
+            hooks["PreToolUse"] = [HookMatcher(matcher="Bash", hooks=[sandbox_proxy_bypass_hook])]
+
+        sandbox_settings: SandboxSettings | None = None
+        if self.sandbox:
+            extra_writable = [Path(root).resolve().as_posix() for root in self.extra_shell_writable_roots]
+            sandbox_settings = SandboxSettings(
+                enabled=True,
+                autoAllowBashIfSandboxed=True,
+                excludedCommands=[],
+                allowUnsandboxedCommands=False,
+                network=network_config,
+                ignoreViolations=SandboxIgnoreViolations(
+                    file=[
+                        self.working_dir.resolve().as_posix(),
+                        Path(os.environ.get("TMPDIR") or tempfile.gettempdir()).resolve().as_posix(),
+                        "/private/tmp",
+                    ] + extra_writable,
+                ),
+                enableWeakerNestedSandbox=self.weaker_nested_sandbox,
+            )
+            # Default sandbox writes are limited to cwd + $TMPDIR. extra_shell_writable_roots
+            # must be granted via filesystem.allowWrite -- listing them only under
+            # ignoreViolations suppresses the violation report but does NOT permit the write.
+            # `filesystem` isn't in the SDK's SandboxSettings TypedDict yet, but the CLI honors
+            # it (verified), so set it as a passthrough key.
+            if extra_writable:
+                sandbox_settings["filesystem"] = {"allowWrite": extra_writable}  # type: ignore[typeddict-unknown-key]
 
         options = ClaudeAgentOptions(
             add_dirs=[Path.home() / ".config/wake", Path.home() / ".cache/wake/explorers"],
@@ -347,26 +430,8 @@ class ClaudeSession(SessionABC):
             effort=self.effort,
             thinking=self.thinking,
             skills=[] if self.ignore_skills else None,
-            hooks={
-                "PreCompact": [
-                    HookMatcher(hooks=[pre_compact_hook])
-                ]
-            },
-            sandbox=SandboxSettings(
-                enabled=True,
-                autoAllowBashIfSandboxed=True,
-                excludedCommands=[],
-                allowUnsandboxedCommands=False,
-                network=network_config,
-                ignoreViolations=SandboxIgnoreViolations(
-                    file=[
-                        self.working_dir.resolve().as_posix(),
-                        Path(os.environ.get("TMPDIR") or tempfile.gettempdir()).resolve().as_posix(),
-                        "/private/tmp",
-                    ] + [Path(root).resolve().as_posix() for root in self.extra_shell_writable_roots],
-                ),
-                enableWeakerNestedSandbox=self.weaker_nested_sandbox,
-            ) if self.sandbox else None
+            hooks=hooks,
+            sandbox=sandbox_settings,
         )
 
         total_cost = 0.0

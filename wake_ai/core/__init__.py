@@ -1,5 +1,5 @@
 """AI Framework components - core infrastructure for AI workflows."""
 
-from .claude import ClaudeSession
+from .claude import ClaudeSession, sandbox_proxy_bypass_hook, SANDBOX_PROXY_BYPASS_PREFIX
 from .codex import CodexSession
 from .flow import AIWorkflow, WorkflowStep, DynamicWorkflowStep
