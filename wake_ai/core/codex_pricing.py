@@ -6,9 +6,78 @@ class CodexTokenPricing(NamedTuple):
     input_mtoken_cost: float
     cached_input_mtoken_cost: float
     output_mtoken_cost: float
+    # Cost per 1M tokens written to the prompt cache. Introduced with the
+    # GPT-5.6 family, which bills cache writes at 1.25x the uncached input rate.
+    # None for pre-5.6 models, which fold cache writes into the input price and
+    # so incur no separate cache-write charge.
+    cache_write_mtoken_cost: float | None = None
 
 
 GPT_PRICING = {
+    # GPT-5.6 series (Sol / Terra / Luna). Adds explicit cache-write billing
+    # (1.25x the tier's uncached input rate). Long-context (>272K input tokens)
+    # requests are surcharged 2x input/cached/cache-write and 1.5x output, the
+    # same as the 5.4/5.5 families — see OpenAITokenUsage.update().
+    "gpt-5.6-sol": {
+        "flex": CodexTokenPricing(
+            input_mtoken_cost=2.50,
+            cached_input_mtoken_cost=0.25,
+            output_mtoken_cost=15.00,
+            cache_write_mtoken_cost=3.125,
+        ),
+        "standard": CodexTokenPricing(
+            input_mtoken_cost=5.00,
+            cached_input_mtoken_cost=0.50,
+            output_mtoken_cost=30.00,
+            cache_write_mtoken_cost=6.25,
+        ),
+        "priority": CodexTokenPricing(
+            input_mtoken_cost=10.00,
+            cached_input_mtoken_cost=1.00,
+            output_mtoken_cost=60.00,
+            cache_write_mtoken_cost=12.50,
+        ),
+    },
+    "gpt-5.6-terra": {
+        "flex": CodexTokenPricing(
+            input_mtoken_cost=1.25,
+            cached_input_mtoken_cost=0.125,
+            output_mtoken_cost=7.50,
+            cache_write_mtoken_cost=1.5625,
+        ),
+        "standard": CodexTokenPricing(
+            input_mtoken_cost=2.50,
+            cached_input_mtoken_cost=0.25,
+            output_mtoken_cost=15.00,
+            cache_write_mtoken_cost=3.125,
+        ),
+        "priority": CodexTokenPricing(
+            input_mtoken_cost=5.00,
+            cached_input_mtoken_cost=0.50,
+            output_mtoken_cost=30.00,
+            cache_write_mtoken_cost=6.25,
+        ),
+    },
+    "gpt-5.6-luna": {
+        "flex": CodexTokenPricing(
+            input_mtoken_cost=0.50,
+            cached_input_mtoken_cost=0.05,
+            output_mtoken_cost=3.00,
+            cache_write_mtoken_cost=0.625,
+        ),
+        "standard": CodexTokenPricing(
+            input_mtoken_cost=1.00,
+            cached_input_mtoken_cost=0.10,
+            output_mtoken_cost=6.00,
+            cache_write_mtoken_cost=1.25,
+        ),
+        "priority": CodexTokenPricing(
+            input_mtoken_cost=2.00,
+            cached_input_mtoken_cost=0.20,
+            output_mtoken_cost=12.00,
+            cache_write_mtoken_cost=2.50,
+        ),
+    },
     "gpt-5.5": {
         "flex": CodexTokenPricing(
             input_mtoken_cost=2.50,

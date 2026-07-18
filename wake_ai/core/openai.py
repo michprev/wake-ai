@@ -96,7 +96,7 @@ WEB_SEARCH_COST_PER_CALL = 0.01
 
 # Models that support OpenAI's native shell tool (FunctionShellTool).
 # All others fall back to the legacy "shell" function workaround.
-_NATIVE_SHELL_MODEL_PREFIXES = ("gpt-5.1", "gpt-5.2", "gpt-5.4", "gpt-5.5")
+_NATIVE_SHELL_MODEL_PREFIXES = ("gpt-5.1", "gpt-5.2", "gpt-5.4", "gpt-5.5", "gpt-5.6")
 
 # OpenAI limits function names to 64 characters ([A-Za-z0-9_-] only).
 _OPENAI_MAX_TOOL_NAME_LEN = 64
@@ -158,30 +158,44 @@ def _resolve_mcp_alias(
 class OpenAITokenUsage:
     input_tokens_total: int
     input_tokens_cached: int
+    input_tokens_cache_write: int
     output_tokens: int
     cost: float
 
-    def __init__(self, input_tokens_total: int = 0, input_tokens_cached: int = 0, output_tokens: int = 0) -> None:
+    def __init__(self, input_tokens_total: int = 0, input_tokens_cached: int = 0, output_tokens: int = 0, input_tokens_cache_write: int = 0) -> None:
         self.input_tokens_total = input_tokens_total
         self.input_tokens_cached = input_tokens_cached
+        self.input_tokens_cache_write = input_tokens_cache_write
         self.output_tokens = output_tokens
         self.cost = 0.0
 
-    def update(self, model: str, tier: Literal["flex", "standard", "priority"], input_tokens_total: int, input_tokens_cached: int, output_tokens: int) -> None:
+    def update(self, model: str, tier: Literal["flex", "standard", "priority"], input_tokens_total: int, input_tokens_cached: int, output_tokens: int, input_tokens_cache_write: int = 0) -> None:
         self.input_tokens_total += input_tokens_total
         self.input_tokens_cached += input_tokens_cached
+        self.input_tokens_cache_write += input_tokens_cache_write
         self.output_tokens += output_tokens
 
-        input_cost = (input_tokens_total - input_tokens_cached) * GPT_PRICING[model][tier].input_mtoken_cost / 1e6
-        cached_input_cost = input_tokens_cached * GPT_PRICING[model][tier].cached_input_mtoken_cost / 1e6
-        output_cost = output_tokens * GPT_PRICING[model][tier].output_mtoken_cost / 1e6
+        pricing = GPT_PRICING[model][tier]
+        if pricing.cache_write_mtoken_cost is not None:
+            # GPT-5.6+: cache writes are billed separately (1.25x input rate).
+            regular = input_tokens_total - input_tokens_cached - input_tokens_cache_write
+            input_cost = regular * pricing.input_mtoken_cost / 1e6
+            cached_input_cost = input_tokens_cached * pricing.cached_input_mtoken_cost / 1e6
+            cache_write_cost = input_tokens_cache_write * pricing.cache_write_mtoken_cost / 1e6
+        else:
+            # Pre-5.6: cache writes are folded into the regular input price.
+            input_cost = (input_tokens_total - input_tokens_cached) * pricing.input_mtoken_cost / 1e6
+            cached_input_cost = input_tokens_cached * pricing.cached_input_mtoken_cost / 1e6
+            cache_write_cost = 0.0
+        output_cost = output_tokens * pricing.output_mtoken_cost / 1e6
 
-        if model in {"gpt-5.4", "gpt-5.4-pro", "gpt-5.5", "gpt-5.5-pro"} and input_tokens_total >= 272_000:
+        if model in {"gpt-5.4", "gpt-5.4-pro", "gpt-5.5", "gpt-5.5-pro", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"} and input_tokens_total >= 272_000:
             input_cost *= 2
             cached_input_cost *= 2
+            cache_write_cost *= 2
             output_cost *= 1.5
 
-        self.cost += input_cost + cached_input_cost + output_cost
+        self.cost += input_cost + cached_input_cost + cache_write_cost + output_cost
 
 
 class OpenAITotalTokenUsage:
@@ -197,6 +211,7 @@ class OpenAITotalTokenUsage:
             input_tokens_total=sum(usage.input_tokens_total for tiered_usage in self.usage.values() for usage in tiered_usage.values()),
             input_tokens_cached=sum(usage.input_tokens_cached for tiered_usage in self.usage.values() for usage in tiered_usage.values()),
             output_tokens=sum(usage.output_tokens for tiered_usage in self.usage.values() for usage in tiered_usage.values()),
+            input_tokens_cache_write=sum(usage.input_tokens_cache_write for tiered_usage in self.usage.values() for usage in tiered_usage.values()),
         )
 
     @property
@@ -214,6 +229,7 @@ class OpenAITotalTokenUsage:
         output_tokens: int,
         model: str,
         tier: Literal["flex", "standard", "priority"],
+        input_tokens_cache_write: int = 0,
     ) -> None:
         if model not in self.usage:
             self.usage[model] = {
@@ -221,7 +237,7 @@ class OpenAITotalTokenUsage:
                 "standard": OpenAITokenUsage(),
                 "priority": OpenAITokenUsage(),
             }
-        self.usage[model][tier].update(model, tier, input_tokens_total, input_tokens_cached, output_tokens)
+        self.usage[model][tier].update(model, tier, input_tokens_total, input_tokens_cached, output_tokens, input_tokens_cache_write)
 
     def format_summary(self) -> str:
         lines = ["Token usage:"]
@@ -229,15 +245,21 @@ class OpenAITotalTokenUsage:
             for tier, usage in tiered_usage.items():
                 if usage.input_tokens_total == 0 and usage.output_tokens == 0:
                     continue
+                cached_str = f"cached {usage.input_tokens_cached}"
+                if usage.input_tokens_cache_write:
+                    cached_str += f", written {usage.input_tokens_cache_write}"
                 lines.append(
                     f"  {model} ({tier}): input={usage.input_tokens_total} "
-                    f"(cached {usage.input_tokens_cached}), output={usage.output_tokens}, "
+                    f"({cached_str}), output={usage.output_tokens}, "
                     f"cost=${usage.cost:.4f}"
                 )
         total = self.total_tokens
+        total_cached_str = f"cached {total.input_tokens_cached}"
+        if total.input_tokens_cache_write:
+            total_cached_str += f", written {total.input_tokens_cache_write}"
         summary = (
             f"  total: input={total.input_tokens_total} "
-            f"(cached {total.input_tokens_cached}), output={total.output_tokens}"
+            f"({total_cached_str}), output={total.output_tokens}"
         )
         if self.web_search_calls:
             summary += f", web_search_calls={self.web_search_calls}"
@@ -542,6 +564,7 @@ class OpenAISession(SessionABC):
                         output_tokens=compacted.usage.output_tokens,
                         model=model,
                         tier="standard",
+                        input_tokens_cache_write=compacted.usage.input_tokens_details.cache_write_tokens,
                     )
                     self.conversation = cast(
                         list[ResponseInputItemParam],
@@ -652,6 +675,7 @@ class OpenAISession(SessionABC):
                                 output_tokens=response.usage.output_tokens,
                                 model=model,
                                 tier=service_tier,
+                                input_tokens_cache_write=response.usage.input_tokens_details.cache_write_tokens,
                             )
 
                         if response.incomplete_details is not None:
