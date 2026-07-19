@@ -405,6 +405,13 @@ class WorkflowStep:
     validation_retry_model: str | None
     max_validation_retries: int
     max_validation_retry_cost: float | None
+    # Nudge: after the session finishes on its own terms, `nudge(step)` returns a
+    # follow-up prompt (or None to stop) to poke the model into continuing /
+    # self-checking. Unlike the validator, a nudge never fails the step.
+    nudge: Callable[[WorkflowStep], str | None] | None
+    max_nudges: int
+    max_nudge_cost: float | None
+    nudge_model: str | None
     pre_hook: Callable[[WorkflowStep], Any] | None
     post_hook: Callable[[WorkflowStep], Any] | None
     condition: Callable[[WorkflowStep], bool] | None
@@ -415,6 +422,8 @@ class WorkflowStep:
     # mutable
     status: Literal["pending", "running", "completed", "failed", "skipped"]
     attempt: int = 0  # counterpart to retries
+    nudge_count: int = 0  # counterpart to max_nudges; reset on full-step retry
+    final_message: str | None = None  # terminal message from the latest query on this step's session
     failed_attempts: list[FailedWorkflowStep] = field(default_factory=list)
     substeps: list[SubStep] = field(default_factory=list)
     cost: float = 0.0
@@ -737,6 +746,10 @@ class AIWorkflow(ABC):
         validation_retry_model: str | None = None,
         max_validation_retries: int = 3,
         max_validation_retry_cost: float | None = None,
+        nudge: Callable[[WorkflowStep], str | None] | None = None,
+        max_nudges: int = 1,
+        max_nudge_cost: float | None = None,
+        nudge_model: str | None = None,
         session: SessionABC | None = None,
         pre_hook: Callable[[WorkflowStep], Any] | None = None,
         post_hook: Callable[[WorkflowStep], Any] | None = None,
@@ -778,6 +791,10 @@ class AIWorkflow(ABC):
             validation_retry_model=validation_retry_model,
             max_validation_retries=max_validation_retries,
             max_validation_retry_cost=max_validation_retry_cost,
+            nudge=nudge,
+            max_nudges=max_nudges,
+            max_nudge_cost=max_nudge_cost,
+            nudge_model=nudge_model,
             pre_hook=pre_hook,
             post_hook=post_hook,
             condition=condition,
@@ -868,6 +885,7 @@ class AIWorkflow(ABC):
         host_token = _current_host.set(step)
         try:
             # main prompt query
+            last_info = None
             async for info in step.session.query(
                 step.format_prompt(self.context),
                 step.model,
@@ -880,9 +898,39 @@ class AIWorkflow(ABC):
                 step.cost = info.cost
                 step.context_tokens = getattr(info, "context_tokens", None)
                 step.compaction_count = getattr(info, "compaction_count", 0)
+                last_info = info
 
+            step.final_message = getattr(last_info, "final_message", None)
             total_cost = step.cost
             total_compactions = step.compaction_count
+
+            # nudge loop — poke a session that finished on its own terms to keep
+            # working / self-check. Runs before validation (nudge in task-space,
+            # then let the validator be the final gate). Only nudge on a natural
+            # "succeeded"; never a session that bailed on max cost/turns. Unlike
+            # validation, a nudge never fails the step — the callback returns the
+            # follow-up prompt, or None to stop. Cost accumulates like validation.
+            if step.nudge is not None and getattr(last_info, "status", None) == "succeeded":
+                while step.nudge_count < step.max_nudges:
+                    nudge_prompt = step.nudge(step)
+                    if nudge_prompt is None:
+                        break
+                    step.nudge_count += 1
+
+                    async for info in step.session.query(
+                        nudge_prompt,
+                        step.nudge_model or step.model,
+                        step.max_nudge_cost,
+                        step.formatter,
+                    ):
+                        step.cost = total_cost + info.cost
+                        step.context_tokens = getattr(info, "context_tokens", None)
+                        step.compaction_count = total_compactions + getattr(info, "compaction_count", 0)
+                        last_info = info
+
+                    step.final_message = getattr(last_info, "final_message", None)
+                    total_cost = step.cost
+                    total_compactions = step.compaction_count
 
             # validation + fixing attempts
             if step.validator is not None:
@@ -902,7 +950,9 @@ class AIWorkflow(ABC):
                         step.cost = total_cost + info.cost
                         step.context_tokens = getattr(info, "context_tokens", None)
                         step.compaction_count = total_compactions + getattr(info, "compaction_count", 0)
+                        last_info = info
 
+                    step.final_message = getattr(last_info, "final_message", None)
                     total_cost = step.cost
                     total_compactions = step.compaction_count
 
@@ -1052,6 +1102,8 @@ class AIWorkflow(ABC):
                                 step.substeps = []
 
                                 step.cost = 0.0
+                                step.nudge_count = 0
+                                step.final_message = None
                                 step.status = "pending"
                                 step.start_time = None
                                 step.session.reset()
