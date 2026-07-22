@@ -31,6 +31,7 @@ TERMINATION_PROMPT = (
 class SimpleTotalTokenUsage(TypedDict):
     input_tokens: int
     cached_input_tokens: int
+    cache_write_input_tokens: int
     output_tokens: int
 
 
@@ -51,30 +52,57 @@ def _compute_cost(
             if tier in usage:
                 cost += _compute_cost(usage[tier], costs, tier)
         return cost
+
+    pricing = costs[tier]
+    cached = usage["cached_input_tokens"]
+    cache_write = usage.get("cache_write_input_tokens", 0)
+    if pricing.cache_write_mtoken_cost is not None:
+        # GPT-5.6+: cache writes are billed separately (see CodexTokenPricing),
+        # mirroring OpenAITokenUsage.update().
+        regular = usage["input_tokens"] - cached - cache_write
+        cache_write_cost = cache_write * pricing.cache_write_mtoken_cost / 1e6
     else:
-        non_cached_input_tokens = (
-            usage["input_tokens"] - usage["cached_input_tokens"]
-        )
-        cost = (
-            non_cached_input_tokens * costs[tier].input_mtoken_cost / 1e6
-            + usage["cached_input_tokens"] * costs[tier].cached_input_mtoken_cost / 1e6
-            + usage["output_tokens"] * costs[tier].output_mtoken_cost / 1e6
-        )
-        return cost
+        # Pre-5.6: cache writes are folded into the regular input price.
+        regular = usage["input_tokens"] - cached
+        cache_write_cost = 0.0
+    return (
+        regular * pricing.input_mtoken_cost / 1e6
+        + cached * pricing.cached_input_mtoken_cost / 1e6
+        + cache_write_cost
+        + usage["output_tokens"] * pricing.output_mtoken_cost / 1e6
+    )
 
 
-def _context_tokens(usage: SimpleTotalTokenUsage | TieredTotalTokenUsage) -> int:
-    """Input tokens of the latest turn ≈ current context size."""
-    if "input_tokens" in usage:
-        return usage["input_tokens"]
-    return sum(usage[tier]["input_tokens"] for tier in ("flex", "standard", "priority") if tier in usage)
+def _normalize_usage(usage: dict[str, Any]) -> SimpleTotalTokenUsage:
+    """Flatten a codex `turn.completed` `usage` dict into a SimpleTotalTokenUsage.
+
+    codex reports the thread's LIFETIME-cumulative usage on every turn (prior
+    turns are reloaded from the rollout on `resume`), as a single untiered
+    object — NOT the size of the current context window.
+    """
+    return SimpleTotalTokenUsage(
+        input_tokens=usage.get("input_tokens", 0),
+        cached_input_tokens=usage.get("cached_input_tokens", 0),
+        cache_write_input_tokens=usage.get("cache_write_input_tokens", 0),
+        output_tokens=usage.get("output_tokens", 0),
+    )
+
+
+def _usage_delta(current: SimpleTotalTokenUsage, previous: SimpleTotalTokenUsage) -> SimpleTotalTokenUsage:
+    """Component-wise ``current - previous`` (both are LIFETIME totals)."""
+    return SimpleTotalTokenUsage(
+        input_tokens=current["input_tokens"] - previous["input_tokens"],
+        cached_input_tokens=current["cached_input_tokens"] - previous["cached_input_tokens"],
+        cache_write_input_tokens=current["cache_write_input_tokens"] - previous["cache_write_input_tokens"],
+        output_tokens=current["output_tokens"] - previous["output_tokens"],
+    )
 
 
 class CodexResponse(NamedTuple):
     cost: float
     status: Literal["running", "terminating_on_max_cost", "succeeded", "terminated", "errored"]
     final_message: str | None = None
-    context_tokens: int | None = None  # input tokens of the latest turn ≈ current context size
+    context_tokens: int | None = None  # always None: codex exec exposes no per-request/context-window size
     compaction_count: int = 0
 
 
@@ -162,9 +190,9 @@ class CodexSession(SessionABC):
         self.additional_options = additional_options or {}
 
         self.token_usage = TieredTotalTokenUsage(
-            flex=SimpleTotalTokenUsage(input_tokens=0, cached_input_tokens=0, output_tokens=0),
-            standard=SimpleTotalTokenUsage(input_tokens=0, cached_input_tokens=0, output_tokens=0),
-            priority=SimpleTotalTokenUsage(input_tokens=0, cached_input_tokens=0, output_tokens=0),
+            flex=SimpleTotalTokenUsage(input_tokens=0, cached_input_tokens=0, cache_write_input_tokens=0, output_tokens=0),
+            standard=SimpleTotalTokenUsage(input_tokens=0, cached_input_tokens=0, cache_write_input_tokens=0, output_tokens=0),
+            priority=SimpleTotalTokenUsage(input_tokens=0, cached_input_tokens=0, cache_write_input_tokens=0, output_tokens=0),
         )
         self._last_message = None
         self._instructions_file = None
@@ -174,16 +202,14 @@ class CodexSession(SessionABC):
     def session_id(self) -> str | None:
         return self._session_id
 
-    def _update_token_usage(self, usage: SimpleTotalTokenUsage | TieredTotalTokenUsage, initial_usage: TieredTotalTokenUsage) -> None:
-        if "input_tokens" in usage:
-            self.token_usage["standard"]["input_tokens"] = usage["input_tokens"] + initial_usage["standard"]["input_tokens"]
-            self.token_usage["standard"]["cached_input_tokens"] = usage["cached_input_tokens"] + initial_usage["standard"]["cached_input_tokens"]
-            self.token_usage["standard"]["output_tokens"] = usage["output_tokens"] + initial_usage["standard"]["output_tokens"]
-        else:
-            for tier in ["flex", "standard", "priority"]:
-                self.token_usage[tier]["input_tokens"] = usage[tier]["input_tokens"] + initial_usage[tier]["input_tokens"]
-                self.token_usage[tier]["cached_input_tokens"] = usage[tier]["cached_input_tokens"] + initial_usage[tier]["cached_input_tokens"]
-                self.token_usage[tier]["output_tokens"] = usage[tier]["output_tokens"] + initial_usage[tier]["output_tokens"]
+    def _set_lifetime_usage(self, lifetime: SimpleTotalTokenUsage) -> None:
+        """Record codex's latest LIFETIME-cumulative usage.
+
+        codex `exec` is single-tier from our side, so the untiered figure is
+        stored under ``standard``. This is a SET (not an accumulate): the value
+        codex reports already includes every prior turn on the thread.
+        """
+        self.token_usage["standard"] = lifetime
 
     def _write_instructions_file(self) -> str:
         """Write the system prompt to a temp file for codex's `model_instructions_file` config (once)."""
@@ -504,7 +530,12 @@ class CodexSession(SessionABC):
         else:
             raise ValueError(f"No pricing found for model '{model}'. Please provide models_pricing.")
 
-        initial_token_usage = deepcopy(self.token_usage)
+        # codex reports the thread's LIFETIME-cumulative usage on every turn (see
+        # `_normalize_usage`), reloading prior turns on `resume`. This query's
+        # incremental cost is therefore the DELTA of that lifetime total across
+        # the query — not the raw reported value, which on a resumed session
+        # already includes (and would re-bill) every previous turn.
+        query_start_usage = deepcopy(self.token_usage["standard"])
         self._last_message = None
 
         # Expose in-process Python `tools` to codex via a short-lived HTTP MCP server.
@@ -518,8 +549,9 @@ class CodexSession(SessionABC):
             self._tools_mcp_url = await tools_server.start()
 
         try:
-            # each launched process starts counting tokens from the beginning
-            # (even if we continue an existing session)
+            # On `resume`, codex reloads the thread and its running token totals,
+            # so each turn's reported `usage` is the thread's LIFETIME total — we
+            # bill the per-query delta against `query_start_usage` (captured above).
             proc = await self._setup_process(prompt, model, formatter)
 
             if self.instructions is not None:
@@ -528,19 +560,15 @@ class CodexSession(SessionABC):
             formatter.print_user_message(prompt)
             terminated = False
             cost = 0.0
-            context_tokens: int | None = None
 
             async for msg in self._receive_messages(proc):
                 self._process_message(msg, formatter)
 
                 if msg["type"] == "turn.completed":
-                    self._update_token_usage(msg["usage"], initial_token_usage)
-                    context_tokens = _context_tokens(msg["usage"])
-                    cost = _compute_cost(
-                        msg["usage"],
-                        model_pricing,
-                    )
-                    yield CodexResponse(cost=cost, status="running", final_message=self._last_message, context_tokens=context_tokens)
+                    lifetime = _normalize_usage(msg["usage"])
+                    self._set_lifetime_usage(lifetime)
+                    cost = _compute_cost(_usage_delta(lifetime, query_start_usage), model_pricing)
+                    yield CodexResponse(cost=cost, status="running", final_message=self._last_message)
 
                     if max_cost is not None and cost > max_cost:
                         proc.terminate()
@@ -555,21 +583,21 @@ class CodexSession(SessionABC):
 
             if terminated:
                 formatter.print_user_message(TERMINATION_PROMPT)
+                # Re-baseline: the continuation turn is billed as ITS delta only;
+                # `main_cost` already covers everything up to this point.
+                query_start_usage = deepcopy(self.token_usage["standard"])
                 proc = await self._setup_process(TERMINATION_PROMPT, model, formatter)
 
                 async for msg in self._receive_messages(proc):
                     self._process_message(msg, formatter)
 
                     if msg["type"] == "turn.completed":
-                        self._update_token_usage(msg["usage"], initial_token_usage)
-                        context_tokens = _context_tokens(msg["usage"])
-                        cost = _compute_cost(
-                            msg["usage"],
-                            model_pricing,
-                        )
-                        yield CodexResponse(cost=main_cost + cost, status="terminating_on_max_cost", final_message=self._last_message, context_tokens=context_tokens)
+                        lifetime = _normalize_usage(msg["usage"])
+                        self._set_lifetime_usage(lifetime)
+                        cost = _compute_cost(_usage_delta(lifetime, query_start_usage), model_pricing)
+                        yield CodexResponse(cost=main_cost + cost, status="terminating_on_max_cost", final_message=self._last_message)
 
-            yield CodexResponse(cost=main_cost + cost, status="succeeded", final_message=self._last_message, context_tokens=context_tokens)
+            yield CodexResponse(cost=main_cost + cost, status="succeeded", final_message=self._last_message)
         finally:
             self._tools_mcp_url = None
             if tools_server is not None:
