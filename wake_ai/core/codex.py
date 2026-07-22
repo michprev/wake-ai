@@ -304,6 +304,11 @@ class CodexSession(SessionABC):
             if self.mcp_call_timeout is not None:
                 args.append("-c")
                 args.append(f"{prefix}.tool_timeout_sec={json.dumps(self.mcp_call_timeout)}")
+            # Headless `exec` has no approver: without this, tools whose approval mode
+            # resolves to "requires approval" (the default for un-annotated tools under
+            # a non-bypass sandbox) get auto-cancelled ("user cancelled MCP tool call").
+            args.append("-c")
+            args.append(f'{prefix}.default_tools_approval_mode="approve"')
 
         # In-process Python `tools` are exposed via a streamable-HTTP MCP server
         # started for the duration of the query (see `query`). `required` makes codex
@@ -318,6 +323,8 @@ class CodexSession(SessionABC):
             args.append(f"{prefix}.required=true")
             args.append("-c")
             args.append(f"{prefix}.startup_timeout_sec={_TOOLS_MCP_STARTUP_TIMEOUT_SEC}")
+            args.append("-c")
+            args.append(f'{prefix}.default_tools_approval_mode="approve"')
             if self.mcp_call_timeout is not None:
                 args.append("-c")
                 args.append(f"{prefix}.tool_timeout_sec={json.dumps(self.mcp_call_timeout)}")
