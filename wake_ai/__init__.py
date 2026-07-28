@@ -37,6 +37,9 @@ from .utils.formatters import (
 from .utils.workflow import (
     load_workflow_from_file,
 )
+from .utils.common import (
+    render_template,
+)
 
 # Template imports
 from .templates import (

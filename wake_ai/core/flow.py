@@ -16,8 +16,6 @@ import signal
 import sys
 from typing import Any, Awaitable, Literal, Callable, Coroutine, TypeVar, Generic, cast
 
-import jinja2
-import jinja2.meta
 import rich_click as click
 from rich.console import Console
 from rich.live import Live
@@ -31,6 +29,7 @@ from .codex_pricing import GPT_PRICING
 from .session_abc import SessionABC
 from .verbose_formatter import VerboseFormatter
 from ..results import AIResult
+from ..utils.common import render_template
 from ..utils.logging import get_verbosity_level
 
 
@@ -475,23 +474,11 @@ class WorkflowStep:
         return None
 
     def format_prompt(self, context: dict[str, Any]) -> str:
-        env = jinja2.Environment(
-            undefined=jinja2.StrictUndefined,
-            loader=jinja2.FileSystemLoader(str(self.prompt.parent)) if isinstance(self.prompt, Path) else None
+        return render_template(
+            self.prompt,
+            {**context, **self.additional_context},
+            name=f"step '{self.name}'",
         )
-        prompt_text = self.prompt.read_text() if isinstance(self.prompt, Path) else self.prompt
-
-        # Parse the template to find all variables
-        ast = env.parse(prompt_text)
-        prompt_context_keys = jinja2.meta.find_undeclared_variables(ast)
-
-        # Warn if there are context keys that are not in the context
-        for key in prompt_context_keys:
-            if key not in context and key not in self.additional_context:
-                print(f"Context key '{key}' used in step '{self.name}' not provided")
-
-        template = env.from_string(prompt_text)
-        return template.render(**context, **self.additional_context)
 
     def __hash__(self) -> int:
         return hash(self.name)

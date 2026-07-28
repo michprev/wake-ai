@@ -12,6 +12,7 @@
     -   [Working Directory vs Execution Directory](#working-directory-vs-execution-directory)
     -   [Validation](#validation)
     -   [Claude Session Management](#claude-session-management)
+    -   [Templating System Prompts / Instructions](#templating-system-prompts--instructions)
     -   [Workflow Execution Flow](#workflow-execution-flow)
 -   [Creating Workflows](#creating-workflows)
     -   [AI-Assisted Workflow Generation](#ai-assisted-workflow-generation)
@@ -211,6 +212,28 @@ Wake AI contains intelligent wrappers for the Claude Code API that provide:
 -   **Cost Control**: Set cost limits for each step, where the wrapper automatically loops through `claude code` execution in configurable increments, monitoring accumulated costs after each increment
 -   **Smart Cost Management**: When approaching the specified `max_cost_limit` threshold, the wrapper prompts Claude to efficiently finish the task
 -   **Automatic Validation**: If a validation function is provided, the wrapper automatically retries the step, prompting `claude code` to fix errors returned by the validation function
+
+### Templating System Prompts / Instructions
+
+**Step prompts** are rendered with Jinja2 automatically at execution time (against the live workflow context). **System prompts / instructions are not** — they are attributes on the session (`ClaudeSession(system_prompt=...)`, `CodexSession`/`LocalSession(instructions=...)`) and are handed to the backend verbatim.
+
+To template a system prompt, render it yourself with the shared `render_template` helper — the *same* engine the step prompts use — and pass the result into the session constructor:
+
+```python
+from wake_ai import render_template, ClaudeSession
+
+system_prompt = render_template(
+    "You are auditing {{ target }}. Write results under {{ working_dir }}.",
+    {"target": target, "working_dir": str(self.working_dir)},
+)
+session = ClaudeSession(self.execution_dir, self.working_dir, system_prompt=system_prompt)
+```
+
+`render_template` accepts a template string or a `Path` to a template file, and behaves **identically to step prompts**: it uses `jinja2.StrictUndefined`, so a variable that is *used* but missing from the context raises `jinja2.UndefinedError` (a non-fatal warning is also printed for any referenced-but-missing variable). The usual escape hatches apply — `{% if x is defined %}` and `{{ x | default(...) }}` do not raise.
+
+Because this is *static* rendering, the context must be known at the point you build the session (e.g. `working_dir`, targets, config) — it does not have access to later step outputs.
+
+> **Note (dynamic changes):** `system_prompt` / `instructions` are plain, mutable attributes. `ClaudeSession` and `LocalSession` re-read them on every query, so reassigning between queries takes effect. `CodexSession` writes its instructions to a temp file **once** and reuses it (even across `reset()`), so changing `instructions` after the first query has no effect unless its internal `_instructions_file` cache is also invalidated.
 
 ### Workflow Execution Flow
 

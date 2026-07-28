@@ -128,7 +128,17 @@ Wake AI uses Jinja2 templating for prompt templates:
 - Variables are referenced with double curly braces: `{{variable_name}}`
 - Code examples with curly braces no longer need escaping
 - Supports Jinja2 features like conditionals and loops (if needed)
-- Missing variables will raise errors to catch typos early
+- Missing variables will raise errors to catch typos early (`jinja2.StrictUndefined`)
+
+**System prompts / instructions are not auto-templated.** Step prompts render automatically at execution time, but a session's `system_prompt` (Claude) / `instructions` (Codex, Local) is passed to the backend verbatim. To template one, render it yourself with `render_template` (the same engine, same missing-variable behavior) before constructing the session:
+
+```python
+from wake_ai import render_template, ClaudeSession
+sys = render_template("Audit {{ target }}", {"target": target})
+session = ClaudeSession(self.execution_dir, self.working_dir, system_prompt=sys)
+```
+
+This is static rendering — the context must exist when the session is built (no access to later step outputs). See `docs/README.md` → "Templating System Prompts / Instructions" for the dynamic-mutation caveat (Codex caches its instructions file).
 
 ## Working Directory Structure
 
