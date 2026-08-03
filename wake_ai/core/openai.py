@@ -1,23 +1,14 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import os
-import platform
-import random
-import re
 import uuid
-from dataclasses import dataclass
-from datetime import timedelta
 from pathlib import Path
 from typing import AsyncIterator, NamedTuple, Literal, Any, cast
 
 import httpx
 from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
-from mcp.client.sse import sse_client
-from mcp.client.streamable_http import streamablehttp_client
 from mcp.types import TextContent
 from openai import APIError, AsyncOpenAI, omit
 from openai.types.responses import EasyInputMessageParam, FunctionToolParam, ResponseIncompleteEvent, ResponseAudioDeltaEvent, ResponseCompletedEvent, ResponseCreatedEvent, ResponseFunctionCallArgumentsDeltaEvent, ResponseFunctionCallArgumentsDoneEvent, ResponseFunctionShellCallOutputContentParam, ResponseFunctionShellToolCall, ResponseFunctionToolCall, ResponseInProgressEvent, ResponseOutputItemAddedEvent, ResponseOutputItemDoneEvent, ResponseOutputMessage, ResponseOutputRefusal, ResponseOutputText, ResponseReasoningItem, ResponseTextConfigParam, ResponseTextDeltaEvent, ResponseTextDoneEvent, ToolParam, WebSearchToolParam
@@ -29,9 +20,18 @@ from openai.types.responses.response_input_param import FunctionCallOutput, Shel
 from openai.types.shared_params import ResponseFormatText
 from openai.types.shared_params.reasoning import Reasoning
 
+from .api_session_utils import (
+    SHELL_INPUT_SCHEMA as LEGACY_SHELL_INPUT_SCHEMA,
+    SSEServerParameters,
+    StreamableHTTPServerParameters,
+    compute_backoff_time as _compute_backoff_time,
+    mcp_tool_alias as _mcp_tool_alias,
+    normalize_mcp_schema as _normalize_mcp_schema,
+    open_mcp_clients,
+    resolve_mcp_alias as _resolve_mcp_alias,
+    run_sandboxed,
+)
 from .codex_pricing import GPT_PRICING
-from .landlock import run_under_landlock
-from .seatbelt import run_under_seatbelt
 from .session_abc import SessionABC, FunctionTool
 from .verbose_formatter import VerboseFormatter
 from ..utils.logging import get_logger
@@ -47,45 +47,6 @@ class OpenAIResponse(NamedTuple):
     compaction_count: int = 0
 
 
-def _normalize_mcp_schema(schema: Any) -> dict[str, Any]:
-    """Ensure MCP inputSchema includes 'properties' — required by OpenAI for object schemas."""
-    if not isinstance(schema, dict) or schema.get("type") != "object":
-        return {"type": "object", "properties": {}}
-    if "properties" not in schema:
-        return {**schema, "properties": {}}
-    return schema
-
-
-def _compute_backoff_time(retry: int) -> float:
-    # base time is 20 seconds, exponential growth; 10% jitter
-    # retry starts at 0
-    exp = 2.0 ** retry
-    base = 20 * exp
-    return base * random.uniform(0.9, 1.1)
-
-
-LEGACY_SHELL_INPUT_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "commands": {
-            "type": "array",
-            "description": "A list of shell commands to execute. Execution in order is NOT guaranteed.",
-            "items": {
-                "type": "string",
-            },
-        },
-        "timeout_ms": {
-            "type": "number",
-            "description": "The timeout in milliseconds for each command.",
-        },
-        "max_output_length": {
-            "type": "integer",
-            "description": "The maximum output length in characters for each command.",
-        },
-    },
-    "required": ["commands", "timeout_ms"],
-}
-
 MAX_COMPACTIONS = 5
 
 # OpenAI bills the hosted `web_search` tool per call ($10 / 1,000 calls). This
@@ -97,62 +58,6 @@ WEB_SEARCH_COST_PER_CALL = 0.01
 # Models that support OpenAI's native shell tool (FunctionShellTool).
 # All others fall back to the legacy "shell" function workaround.
 _NATIVE_SHELL_MODEL_PREFIXES = ("gpt-5.1", "gpt-5.2", "gpt-5.4", "gpt-5.5", "gpt-5.6")
-
-# OpenAI limits function names to 64 characters ([A-Za-z0-9_-] only).
-_OPENAI_MAX_TOOL_NAME_LEN = 64
-_ALIAS_HASH_LEN = 8  # hex chars appended when the slug must be shortened
-
-
-def _slugify(s: str) -> str:
-    """Replace characters outside [A-Za-z0-9_-] with underscore."""
-    return re.sub(r"[^A-Za-z0-9_-]", "_", s)
-
-
-def _mcp_tool_alias(server_name: str, tool_name: str) -> str:
-    """Return a stable OpenAI-safe function name for an MCP tool.
-
-    Format: ``<server>__<tool>`` (both parts slugified). If the result exceeds
-    64 characters, the slug is truncated and an 8-hex-char SHA-256 suffix of
-    the original names is appended so the alias stays both within the limit
-    and stable across restarts.
-    """
-    slug = f"{_slugify(server_name)}__{_slugify(tool_name)}"
-    if len(slug) <= _OPENAI_MAX_TOOL_NAME_LEN:
-        return slug
-    h = hashlib.sha256(f"{server_name}\x00{tool_name}".encode()).hexdigest()[:_ALIAS_HASH_LEN]
-    return f"{slug[:_OPENAI_MAX_TOOL_NAME_LEN - _ALIAS_HASH_LEN - 1]}_{h}"
-
-
-def _resolve_mcp_alias(
-    server_name: str,
-    tool_name: str,
-    reserved: set[str],
-    registered: dict[str, Any],
-) -> str | None:
-    """Return a unique OpenAI-safe alias for an MCP tool, or ``None`` if impossible.
-
-    Tries the primary slug first; if it collides, a hash-disambiguated form is
-    used. Returns ``None`` (with error log) only if both forms are already taken.
-    """
-    alias = _mcp_tool_alias(server_name, tool_name)
-    if alias not in reserved and alias not in registered:
-        return alias
-
-    h = hashlib.sha256(f"{server_name}\x00{tool_name}".encode()).hexdigest()[:_ALIAS_HASH_LEN]
-    disambiguated = f"{alias[:_OPENAI_MAX_TOOL_NAME_LEN - _ALIAS_HASH_LEN - 1]}_{h}"
-    logger.warning(
-        "MCP tool '%s' from '%s' has conflicting alias '%s'; "
-        "registering as '%s' instead.",
-        tool_name, server_name, alias, disambiguated,
-    )
-    if disambiguated in reserved or disambiguated in registered:
-        logger.error(
-            "Cannot register MCP tool '%s' from '%s': "
-            "disambiguated alias '%s' also taken. Skipping.",
-            tool_name, server_name, disambiguated,
-        )
-        return None
-    return disambiguated
 
 
 class OpenAITokenUsage:
@@ -268,23 +173,6 @@ class OpenAITotalTokenUsage:
         return "\n".join(lines)
 
 
-@dataclass
-class SSEServerParameters:
-    url: str
-    headers: dict[str, str] | None = None
-    timeout: float = 5
-    sse_read_timeout: float = 60 * 5
-
-
-@dataclass
-class StreamableHTTPServerParameters:
-    url: str
-    headers: dict[str, str] | None = None
-    timeout: float = 5
-    sse_read_timeout: float = 60 * 5
-    terminate_on_close: bool = False
-
-
 class ResponseIncompleteError(Exception):
     reason: str | None
 
@@ -395,9 +283,6 @@ class OpenAISession(SessionABC):
         return await asyncio.wait_for(tool.handler(**input), timeout=self.tool_call_timeout)
 
     async def _call_shell(self, commands: list[str], timeout_ms: int | None, max_output_length: int | None) -> list[ResponseFunctionShellCallOutputContentParam]:
-        if platform.system() not in {"Darwin", "Linux"}:
-            raise NotImplementedError("Shell tools are only supported on macOS and Linux")
-
         timeout = timeout_ms / 1000.0 if timeout_ms is not None else 10 * 60  # seconds (10 min default)
         max_length = max_output_length if max_output_length is not None else 1000000
 
@@ -406,10 +291,7 @@ class OpenAISession(SessionABC):
         for command in commands:
             try:
                 writable_roots = [Path(root) for root in self.writable_roots]
-                if platform.system() == "Darwin":
-                    stdout, stderr, returncode = await run_under_seatbelt(command, self.shell_network_access, writable_roots, timeout, self.execution_dir)
-                else:
-                    stdout, stderr, returncode = await run_under_landlock(command, self.shell_network_access, writable_roots, timeout, self.execution_dir)
+                stdout, stderr, returncode = await run_sandboxed(command, self.shell_network_access, writable_roots, timeout, self.execution_dir)
 
                 output.append(ResponseFunctionShellCallOutputContentParam(
                     outcome=OutcomeExit(
@@ -800,39 +682,7 @@ class OpenAISession(SessionABC):
         if self._session_id is None:
             self._session_id = uuid.uuid4().hex
 
-        mcp_clients = {}
-        opened_clients = []
-
-        try:
-            for server_name, info in self.mcps.items():
-                if isinstance(info, ClientSession):
-                    mcp_clients[server_name] = info
-                else:
-                    if isinstance(info, StdioServerParameters):
-                        handle = stdio_client(info)
-                        read, write = await handle.__aenter__()
-                    elif isinstance(info, SSEServerParameters):
-                        handle = sse_client(info.url, info.headers, info.timeout, info.sse_read_timeout)
-                        read, write = await handle.__aenter__()
-                    elif isinstance(info, StreamableHTTPServerParameters):
-                        handle = streamablehttp_client(info.url, info.headers, 60, 60, False)
-                        read, write, _ = await handle.__aenter__()
-                    else:
-                        raise ValueError(f"Unknown MCP server type: {type(info)}")
-
-                    opened_clients.append(handle)
-
-                    client = ClientSession(
-                        read,
-                        write,
-                        read_timeout_seconds=timedelta(seconds=self.request_timeout) if self.request_timeout is not None else None,
-                    )
-                    opened_clients.append(client)
-
-                    session = await client.__aenter__()
-                    await session.initialize()
-                    mcp_clients[server_name] = session
-
+        async with open_mcp_clients(self.mcps, self.request_timeout) as mcp_clients:
             formatter.print_user_message(prompt)
 
             initial_cost = self.total_token_usage.total_cost
@@ -854,9 +704,6 @@ class OpenAISession(SessionABC):
 
             formatter.print_system_message(self.total_token_usage.format_summary())
             yield OpenAIResponse(cost=self.total_token_usage.total_cost - initial_cost, status="succeeded", final_message=self._last_message, context_tokens=context_tokens, compaction_count=compaction_count)
-        finally:
-            for client in reversed(opened_clients):
-                await client.__aexit__(None, None, None)
 
 
     def reset(self) -> None:
