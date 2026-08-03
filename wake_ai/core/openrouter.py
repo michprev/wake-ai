@@ -34,6 +34,20 @@ MAX_COMPACTIONS = 5
 MAX_COMPACT_TRUNCATIONS = 3
 
 
+class MidStreamError(Exception):
+    """OpenRouter delivered an error object inside the SSE stream."""
+
+    def __init__(self, error: Any) -> None:
+        self.error = error
+
+    def __str__(self) -> str:
+        return f"Provider returned mid-stream error: {self.error}"
+
+
+def _is_context_length_error(e: Exception) -> bool:
+    return False  # implemented in the compaction task
+
+
 class OpenRouterResponse(NamedTuple):
     cost: float
     status: Literal["running", "terminating_on_max_cost", "succeeded", "terminated", "errored"]
@@ -404,6 +418,233 @@ class OpenRouterSession(SessionABC):
         )
         return prompt_tokens
 
-    async def query(self, prompt, model, max_cost, formatter):  # implemented in a later task
-        raise NotImplementedError
-        yield  # pragma: no cover — makes this an async generator per SessionABC
+    async def _create_stream(self, model: str, tools: list[dict[str, Any]]) -> Any:
+        """One streaming chat-completions request. Thin wrapper so tests can fake it."""
+        return await asyncio.wait_for(
+            self.client.chat.completions.create(
+                model=model,
+                messages=self._request_messages(),
+                tools=tools or omit,
+                stream=True,
+                extra_body=self._build_extra_body(),
+                timeout=self.request_timeout,
+            ),
+            timeout=self.request_timeout,
+        )
+
+    async def _iter_stream(self, stream: Any, timeout: float | None) -> AsyncIterator[Any]:
+        """Iterate a stream enforcing an idle timeout between chunks.
+
+        Same rationale as OpenAISession._iter_response_events: httpx timeouts are
+        not reliably enforced mid-stream, so each __anext__ is wrapped in
+        wait_for and the stream is always closed.
+        """
+        try:
+            it = stream.__aiter__()
+            while True:
+                try:
+                    event = await asyncio.wait_for(it.__anext__(), timeout=timeout)
+                except StopAsyncIteration:
+                    return
+                yield event
+        finally:
+            await stream.close()
+
+    async def _call_tool(self, name: str, arguments: str) -> Any:
+        tool = self.tools[name]
+        input = json.loads(arguments) if arguments else {}
+        return await asyncio.wait_for(tool.handler(**input), timeout=self.tool_call_timeout)
+
+    async def _call_shell(self, arguments: str) -> list[dict[str, Any]]:
+        args = json.loads(arguments)
+        if "commands" not in args:
+            raise ValueError("commands not found in arguments")
+        timeout_ms = args.get("timeout_ms")
+        timeout = timeout_ms / 1000.0 if timeout_ms is not None else 10 * 60
+        max_length = args.get("max_output_length") or 1_000_000
+
+        results: list[dict[str, Any]] = []
+        for command in args["commands"]:
+            try:
+                stdout, stderr, returncode = await run_sandboxed(
+                    command,
+                    self.shell_network_access,
+                    [Path(root) for root in self.writable_roots],
+                    timeout,
+                    self.execution_dir,
+                )
+                results.append({
+                    "exit_code": returncode,
+                    "stdout": stdout[:max_length],
+                    "stderr": stderr[:max_length],
+                })
+            except asyncio.TimeoutError:
+                results.append({"outcome": "timeout", "stdout": "", "stderr": ""})
+        return results
+
+    async def _call_mcp_tool(self, client: ClientSession, tool_name: str, arguments: str) -> Any:
+        args = json.loads(arguments) if arguments else {}
+        result = await asyncio.wait_for(client.call_tool(tool_name, args), timeout=self.mcp_call_timeout)
+        if result.structuredContent is not None:
+            return {"isError": result.isError, "structuredContent": result.structuredContent}
+        return {"isError": result.isError, "content": "\n".join(c.text for c in result.content if isinstance(c, TextContent))}
+
+    def _print_turn(self, acc: ChatTurnAccumulator, formatter: VerboseFormatter) -> None:
+        if acc.reasoning_details:
+            for detail in acc.reasoning_details:
+                text = detail.get("text") or detail.get("summary")
+                if text:
+                    formatter.print_thinking(text)
+        elif acc.reasoning:
+            formatter.print_thinking(acc.reasoning)
+        for annotation in acc.annotations:
+            if annotation.get("type") == "url_citation":
+                citation = annotation.get("url_citation") or {}
+                formatter.print_tool_use("web_search", {
+                    "url": citation.get("url"), "title": citation.get("title"),
+                })
+        if acc.content:
+            self._last_message = acc.content
+            formatter.print_agent_message(acc.content)
+
+    async def _stream_messages(
+        self,
+        prompt: str,
+        model: str,
+        mcp_clients: dict[str, ClientSession],
+        formatter: VerboseFormatter,
+    ) -> AsyncIterator[tuple[float, int | None, int]]:
+        tools, mcp_tools = await self._collect_tools(mcp_clients)
+
+        retry = 0
+        compact_reason: str | None = None
+        compact_count = 0
+        context_tokens: int | None = None
+        self._last_message = None
+
+        self.conversation.append({"role": "user", "content": prompt})
+
+        while True:
+            acc = ChatTurnAccumulator()
+            try:
+                if compact_reason is not None:
+                    compact_count += 1
+                    if compact_count > MAX_COMPACTIONS:
+                        raise RuntimeError("max_compactions_reached")
+                    formatter.print_system_message(f"Compacting conversation ({compact_count}/{MAX_COMPACTIONS})")
+                    await self._compact(model, resume_hint=(compact_reason == "length"))
+                    compact_reason = None
+
+                stream = await self._create_stream(model, tools)
+                async for event in self._iter_stream(stream, self.request_timeout):
+                    error = getattr(event, "error", None)
+                    if error:
+                        raise MidStreamError(_to_plain(error))
+                    acc.add_chunk(event)
+                    if getattr(event, "usage", None) is not None:
+                        context_tokens = self._record_usage(model, event.usage)
+            except (APIError, MidStreamError, httpx.RemoteProtocolError, httpx.TimeoutException, asyncio.TimeoutError) as e:
+                if _is_context_length_error(e):
+                    logger.warning("Context length exceeded, compacting conversation")
+                    compact_reason = "context_length"
+                    continue
+
+                formatter.print_error(f"Request failed: {e}")
+                if retry < self.max_retries:
+                    backoff = compute_backoff_time(retry)
+                    logger.warning(f"Request failed, retrying... ({retry + 1}/{self.max_retries}) with backoff time {backoff}")
+                    await asyncio.sleep(backoff)
+                    retry += 1
+                    continue
+                raise e
+
+            retry = 0
+
+            self._print_turn(acc, formatter)
+
+            message = acc.assistant_message()
+            if acc.finish_reason == "length":
+                # output-token exhaustion: incomplete tool calls are dropped, then compact
+                message.pop("tool_calls", None)
+                self.conversation.append(message)
+                logger.warning("Output tokens exceeded, compacting conversation")
+                compact_reason = "length"
+                yield self.total_token_usage.total_cost, context_tokens, compact_count
+                continue
+
+            self.conversation.append(message)
+            yield self.total_token_usage.total_cost, context_tokens, compact_count
+
+            tool_calls = acc.tool_calls()
+            if not tool_calls:
+                break
+
+            # openrouter:web_search never appears here — it is executed server-side
+            tasks: dict[str, asyncio.Task[Any]] = {}
+            for call in tool_calls:
+                name = call["function"]["name"]
+                arguments = call["function"]["arguments"]
+                formatter.print_tool_use(name, arguments)
+                if name == "shell":
+                    tasks[call["id"]] = asyncio.create_task(self._call_shell(arguments))
+                elif name in mcp_tools:
+                    mcp_client, original_name = mcp_tools[name]
+                    tasks[call["id"]] = asyncio.create_task(self._call_mcp_tool(mcp_client, original_name, arguments))
+                elif name in self.tools:
+                    tasks[call["id"]] = asyncio.create_task(self._call_tool(name, arguments))
+                else:
+                    self.conversation.append({
+                        "role": "tool",
+                        "tool_call_id": call["id"],
+                        "content": json.dumps(f"Unknown tool: {name}"),
+                    })
+                    formatter.print_tool_result(f"Unknown tool: {name}", True)
+
+            if tasks:
+                await asyncio.gather(*tasks.values(), return_exceptions=True)
+            for call_id, task in tasks.items():
+                exc = task.exception()
+                if exc is not None:
+                    error_msg = "Tool call timed out" if isinstance(exc, asyncio.TimeoutError) else str(exc)
+                    formatter.print_tool_result(error_msg, True)
+                    output = json.dumps(error_msg)
+                else:
+                    formatter.print_tool_result(task.result(), False)
+                    output = json.dumps(task.result())
+                self.conversation.append({
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": output,
+                })
+
+    async def query(
+        self, prompt: str, model: str, max_cost: float | None, formatter: VerboseFormatter
+    ) -> AsyncIterator[OpenRouterResponse]:
+        if self._session_id is None:
+            self._session_id = uuid.uuid4().hex
+
+        async with open_mcp_clients(self.mcps, self.request_timeout) as mcp_clients:
+            formatter.print_user_message(prompt)
+
+            initial_cost = self.total_token_usage.total_cost
+
+            if max_cost is not None and max_cost <= 0:
+                yield OpenRouterResponse(cost=0.0, status="terminating_on_max_cost")
+                return
+
+            context_tokens: int | None = None
+            compaction_count = 0
+            async for total_cost, context_tokens, compaction_count in self._stream_messages(prompt, model, mcp_clients, formatter):
+                current_cost = total_cost - initial_cost
+                yield OpenRouterResponse(cost=current_cost, status="running", context_tokens=context_tokens, compaction_count=compaction_count)
+                if max_cost is not None and current_cost >= max_cost:
+                    formatter.print_error(f"Max cost reached ({current_cost:.4f} >= {max_cost:.4f}). Stopping query.")
+                    formatter.print_system_message(self.total_token_usage.format_summary())
+                    yield OpenRouterResponse(cost=current_cost, status="terminating_on_max_cost", final_message=self._last_message, context_tokens=context_tokens, compaction_count=compaction_count)
+                    return
+
+            formatter.print_system_message(self.total_token_usage.format_summary())
+            yield OpenRouterResponse(cost=self.total_token_usage.total_cost - initial_cost, status="succeeded", final_message=self._last_message, context_tokens=context_tokens, compaction_count=compaction_count)
+
+    async def _compact(self, model: str, resume_hint: bool) -> None:
+        raise RuntimeError("compaction not implemented yet")  # implemented in the compaction task
