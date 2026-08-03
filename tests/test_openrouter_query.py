@@ -100,6 +100,9 @@ async def test_max_cost_terminates(tmp_path, monkeypatch):
     responses = await collect(session, "go", "deepseek/deepseek-chat", max_cost=0.015)
     assert responses[-1].status == "terminating_on_max_cost"
     assert abs(responses[-1].cost - 0.02) < 1e-9
+    # tools must never dispatch after max-cost termination: a dispatched
+    # "whatever" call would have left an "Unknown tool" tool-role message
+    assert [m["role"] for m in session.conversation] == ["user", "assistant"]
 
 
 async def test_max_cost_zero_short_circuits(tmp_path, monkeypatch):
