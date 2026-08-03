@@ -26,6 +26,7 @@ from rich.traceback import Traceback
 from .claude import ClaudeSession
 from .codex import CodexSession
 from .codex_pricing import GPT_PRICING
+from .openrouter import OpenRouterSession
 from .session_abc import SessionABC
 from .verbose_formatter import VerboseFormatter
 from ..results import AIResult
@@ -59,6 +60,19 @@ def _validate_subagent_name(name: str) -> None:
             f"(ASCII letters/digits/_-., no leading dot, no path separators or "
             f"reserved chars, no whitespace)"
         )
+
+
+def _default_session(model: str, execution_dir: Path, working_dir: Path) -> SessionABC:
+    """Pick the backend for a step that didn't pass an explicit session.
+
+    OpenRouter slugs are always ``vendor/model`` — neither bare GPT names nor
+    Claude model names contain a slash.
+    """
+    if "/" in model:
+        return OpenRouterSession(execution_dir)
+    if model.lower() in GPT_PRICING:
+        return CodexSession(execution_dir)
+    return ClaudeSession(execution_dir, working_dir)
 
 
 # Per-task slot holding the WorkflowStep whose session is currently executing.
@@ -756,10 +770,7 @@ class AIWorkflow(ABC):
             raise ValueError(f"Step contains invalid characters: '{name}'")
 
         if session is None:
-            if model.lower() in GPT_PRICING:
-                session = CodexSession(self.execution_dir)
-            else:
-                session = ClaudeSession(self.execution_dir, self.working_dir)
+            session = _default_session(model, self.execution_dir, self.working_dir)
         else:
             if retries > 0 and session.session_id is not None:
                 raise ValueError("Non-zero retries are not possible when continuing a session")
