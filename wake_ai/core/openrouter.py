@@ -101,3 +101,106 @@ class OpenRouterTotalTokenUsage:
             f"cost=${self.total_cost:.4f}"
         )
         return "\n".join(lines)
+
+
+def _to_plain(value: Any) -> Any:
+    """OpenRouter extra fields normally arrive as plain dicts/lists, but be
+    defensive about pydantic models leaking through."""
+    if hasattr(value, "model_dump"):
+        return value.model_dump(exclude_none=True)
+    return value
+
+
+class ChatTurnAccumulator:
+    """Accumulates chat-completions stream deltas into one complete assistant turn.
+
+    OpenRouter extensions (reasoning, reasoning_details, annotations) are not in
+    the SDK's typed Delta model — they surface via pydantic extra fields, hence
+    the getattr access.
+    """
+
+    content: str | None
+    reasoning: str | None
+    finish_reason: str | None
+    annotations: list[dict[str, Any]]
+
+    def __init__(self) -> None:
+        self.content = None
+        self.reasoning = None
+        self.finish_reason = None
+        self.annotations = []
+        self._tool_calls: dict[int, dict[str, Any]] = {}
+        self._reasoning_details: list[dict[str, Any]] = []
+        self._reasoning_by_index: dict[int, dict[str, Any]] = {}
+
+    @property
+    def reasoning_details(self) -> list[dict[str, Any]]:
+        return self._reasoning_details
+
+    def add_chunk(self, chunk: Any) -> None:
+        if not chunk.choices:
+            return  # usage-only final chunk
+        choice = chunk.choices[0]
+        if choice.finish_reason is not None:
+            self.finish_reason = choice.finish_reason
+        delta = choice.delta
+        if delta is None:
+            return
+
+        if delta.content:
+            self.content = (self.content or "") + delta.content
+
+        reasoning = getattr(delta, "reasoning", None)
+        if isinstance(reasoning, str) and reasoning:
+            self.reasoning = (self.reasoning or "") + reasoning
+
+        details = getattr(delta, "reasoning_details", None)
+        if details:
+            for detail in details:
+                self._merge_reasoning_detail(dict(_to_plain(detail)))
+
+        annotations = getattr(delta, "annotations", None)
+        if annotations:
+            self.annotations.extend(_to_plain(a) for a in annotations)
+
+        if delta.tool_calls:
+            for tc in delta.tool_calls:
+                entry = self._tool_calls.setdefault(tc.index, {
+                    "id": None,
+                    "type": "function",
+                    "function": {"name": "", "arguments": ""},
+                })
+                if tc.id:
+                    entry["id"] = tc.id
+                if tc.function is not None:
+                    if tc.function.name:
+                        entry["function"]["name"] += tc.function.name
+                    if tc.function.arguments:
+                        entry["function"]["arguments"] += tc.function.arguments
+
+    def _merge_reasoning_detail(self, detail: dict[str, Any]) -> None:
+        index = detail.get("index")
+        if index is not None and index in self._reasoning_by_index:
+            existing = self._reasoning_by_index[index]
+            for key, value in detail.items():
+                if key in ("text", "data", "summary") and isinstance(value, str):
+                    existing[key] = existing.get(key, "") + value
+                elif value is not None:
+                    existing[key] = value
+        else:
+            self._reasoning_details.append(detail)
+            if index is not None:
+                self._reasoning_by_index[index] = detail
+
+    def tool_calls(self) -> list[dict[str, Any]]:
+        return [self._tool_calls[i] for i in sorted(self._tool_calls)]
+
+    def assistant_message(self) -> dict[str, Any]:
+        message: dict[str, Any] = {"role": "assistant", "content": self.content}
+        calls = self.tool_calls()
+        if calls:
+            message["tool_calls"] = calls
+        if self._reasoning_details:
+            # replayed verbatim & unreordered — required for reasoning models
+            message["reasoning_details"] = self._reasoning_details
+        return message
