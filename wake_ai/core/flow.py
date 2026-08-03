@@ -69,7 +69,7 @@ def _default_session(model: str, execution_dir: Path, working_dir: Path) -> Sess
     Claude model names contain a slash.
     """
     if "/" in model:
-        return OpenRouterSession(execution_dir)
+        return OpenRouterSession(execution_dir, writable_roots=[working_dir])
     if model.lower() in GPT_PRICING:
         return CodexSession(execution_dir)
     return ClaudeSession(execution_dir, working_dir)

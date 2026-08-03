@@ -40,11 +40,22 @@ def test_extra_body_reasoning_provider_and_escape_hatch(tmp_path):
     assert body["reasoning"] == {"effort": "high"}
     assert body["provider"] == {"order": ["deepseek"], "allow_fallbacks": False}
     assert body["transforms"] == []
+    assert body["usage"] == {"include": True}
 
 
 def test_extra_body_reasoning_max_tokens(tmp_path):
     session = make_session(tmp_path, reasoning_max_tokens=2000)
     assert session._build_extra_body()["reasoning"] == {"max_tokens": 2000}
+
+
+def test_extra_body_usage_accounting_default(tmp_path):
+    session = make_session(tmp_path)
+    assert session._build_extra_body()["usage"] == {"include": True}
+
+
+def test_extra_body_usage_accounting_overridable(tmp_path):
+    session = make_session(tmp_path, extra_body={"usage": {"include": False}})
+    assert session._build_extra_body()["usage"] == {"include": False}
 
 
 async def test_collect_tools_shell_web_search_and_function(tmp_path):

@@ -356,6 +356,7 @@ class OpenRouterSession(SessionABC):
             body["reasoning"] = {"max_tokens": self.reasoning_max_tokens}
         if self.provider is not None:
             body["provider"] = self.provider
+        body["usage"] = {"include": True}
         if self.extra_body:
             body.update(self.extra_body)
         return body
@@ -585,6 +586,7 @@ class OpenRouterSession(SessionABC):
             if acc.finish_reason == "length":
                 # output-token exhaustion: incomplete tool calls are dropped, then compact
                 message.pop("tool_calls", None)
+                message["content"] = message.get("content") or ""
                 self.conversation.append(message)
                 logger.warning("Output tokens exceeded, compacting conversation")
                 compact_reason = "length"
