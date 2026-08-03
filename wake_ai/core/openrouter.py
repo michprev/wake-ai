@@ -204,3 +204,206 @@ class ChatTurnAccumulator:
             # replayed verbatim & unreordered — required for reasoning models
             message["reasoning_details"] = self._reasoning_details
         return message
+
+
+class OpenRouterSession(SessionABC):
+    execution_dir: Path
+    fork_session: "OpenRouterSession | None"
+    instructions: str | None
+    reasoning_effort: Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"] | None
+    reasoning_max_tokens: int | None
+    max_retries: int
+    request_timeout: float | None
+    tool_call_timeout: float | None
+    mcp_call_timeout: float | None
+    tools: dict[str, FunctionTool]
+    shell: bool
+    web_search: bool
+    web_search_engine: Literal["native", "exa", "firecrawl", "parallel", "perplexity"] | None
+    web_search_max_results: int | None
+    mcps: dict[str, ClientSession | StdioServerParameters | SSEServerParameters | StreamableHTTPServerParameters]
+    shell_network_access: bool
+    writable_roots: list[Path | str]
+    provider: dict[str, Any] | None
+    extra_body: dict[str, Any] | None
+
+    client: AsyncOpenAI
+    conversation: list[dict[str, Any]]
+    total_token_usage: OpenRouterTotalTokenUsage
+
+    def __init__(
+        self,
+        execution_dir: Path,
+        *,
+        fork_session: "OpenRouterSession | None" = None,
+        instructions: str | None = None,
+        reasoning_effort: Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"] | None = None,
+        reasoning_max_tokens: int | None = None,
+        max_retries: int = 5,
+        request_timeout: float | None = 1200,  # 20 minutes
+        tool_call_timeout: float | None = 300,  # 5 minutes
+        mcp_call_timeout: float | None = 300,  # 5 minutes
+        tools: list[FunctionTool] | None = None,
+        shell: bool = True,
+        web_search: bool = False,
+        web_search_engine: Literal["native", "exa", "firecrawl", "parallel", "perplexity"] | None = None,
+        web_search_max_results: int | None = None,
+        mcps: dict[str, ClientSession | StdioServerParameters | SSEServerParameters | StreamableHTTPServerParameters] | None = None,
+        shell_network_access: bool = False,
+        writable_roots: list[Path | str] | None = None,
+        provider: dict[str, Any] | None = None,
+        extra_body: dict[str, Any] | None = None,
+    ):
+        if reasoning_effort is not None and reasoning_max_tokens is not None:
+            raise ValueError("reasoning_effort and reasoning_max_tokens are mutually exclusive")
+
+        self.execution_dir = execution_dir
+        self.fork_session = fork_session
+        self.instructions = instructions
+        self.reasoning_effort = reasoning_effort
+        self.reasoning_max_tokens = reasoning_max_tokens
+        self.max_retries = max_retries
+        self.request_timeout = request_timeout
+        self.tool_call_timeout = tool_call_timeout
+        self.mcp_call_timeout = mcp_call_timeout
+        self.shell = shell
+        self.web_search = web_search
+        self.web_search_engine = web_search_engine
+        self.web_search_max_results = web_search_max_results
+        self.mcps = mcps or {}
+        self.shell_network_access = shell_network_access
+        self.writable_roots = writable_roots or []
+        self.provider = provider
+        self.extra_body = extra_body
+
+        self.tools = {}
+        if tools is not None:
+            for tool in tools:
+                self.tools[tool.name] = tool
+
+        self.client = AsyncOpenAI(
+            base_url=OPENROUTER_BASE_URL,
+            api_key=os.getenv("OPENROUTER_API_KEY"),
+            timeout=self.request_timeout,
+            default_headers={
+                "HTTP-Referer": "https://github.com/wakehacker/wake-ai",
+                "X-Title": "Wake AI",
+            },
+        )
+        if fork_session is not None:
+            if not fork_session.conversation:
+                raise ValueError("Forking from OpenRouterSession with empty conversation")
+            self.conversation = fork_session.conversation.copy()
+        else:
+            self.conversation = []
+        self._session_id: str | None = None
+        self.total_token_usage = OpenRouterTotalTokenUsage()
+        self._last_message: str | None = None
+
+    @property
+    def session_id(self) -> str | None:
+        return self._session_id
+
+    def reset(self) -> None:
+        """Reset conversation state and session ID."""
+        self.conversation = []
+        self._session_id = None
+
+    def _request_messages(self) -> list[dict[str, Any]]:
+        messages: list[dict[str, Any]] = []
+        if self.instructions is not None:
+            messages.append({"role": "system", "content": self.instructions})
+        return messages + self.conversation
+
+    def _build_extra_body(self) -> dict[str, Any]:
+        body: dict[str, Any] = {}
+        if self.reasoning_effort is not None:
+            body["reasoning"] = {"effort": self.reasoning_effort}
+        elif self.reasoning_max_tokens is not None:
+            body["reasoning"] = {"max_tokens": self.reasoning_max_tokens}
+        if self.provider is not None:
+            body["provider"] = self.provider
+        if self.extra_body:
+            body.update(self.extra_body)
+        return body
+
+    async def _collect_tools(
+        self, mcp_clients: dict[str, ClientSession]
+    ) -> tuple[list[dict[str, Any]], dict[str, tuple[ClientSession, str]]]:
+        """Build the chat-completions tools array + MCP alias registry."""
+        tools: list[dict[str, Any]] = [
+            {
+                "type": "function",
+                "function": {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.input_schema,
+                },
+            }
+            for tool in self.tools.values()
+        ]
+
+        reserved: set[str] = set(self.tools.keys()) | {"shell"}
+        mcp_tools: dict[str, tuple[ClientSession, str]] = {}
+        for server_name, client in mcp_clients.items():
+            cursor = None
+            while True:
+                response = await client.list_tools(cursor=cursor)
+                for tool in response.tools:
+                    alias = resolve_mcp_alias(server_name, tool.name, reserved, mcp_tools)
+                    if alias is None:
+                        continue
+                    mcp_tools[alias] = (client, tool.name)
+                    tools.append({
+                        "type": "function",
+                        "function": {
+                            "name": alias,
+                            "description": tool.description,
+                            "parameters": normalize_mcp_schema(tool.inputSchema),
+                        },
+                    })
+                if response.nextCursor is None:
+                    break
+                cursor = response.nextCursor
+
+        if self.shell:
+            tools.append({
+                "type": "function",
+                "function": {
+                    "name": "shell",
+                    "description": "Execute multiple shell commands in parallel",
+                    "parameters": SHELL_INPUT_SCHEMA,
+                },
+            })
+
+        if self.web_search:
+            # OpenRouter server tool: executed server-side, agentic (0-N calls).
+            web_tool: dict[str, Any] = {"type": "openrouter:web_search"}
+            parameters: dict[str, Any] = {}
+            if self.web_search_engine is not None:
+                parameters["engine"] = self.web_search_engine
+            if self.web_search_max_results is not None:
+                parameters["max_results"] = self.web_search_max_results
+            if parameters:
+                web_tool["parameters"] = parameters
+            tools.append(web_tool)
+
+        return tools, mcp_tools
+
+    def _record_usage(self, model: str, usage: Any) -> int:
+        prompt_details = getattr(usage, "prompt_tokens_details", None)
+        completion_details = getattr(usage, "completion_tokens_details", None)
+        prompt_tokens = usage.prompt_tokens or 0
+        self.total_token_usage.update(
+            model=model,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=usage.completion_tokens or 0,
+            cached_tokens=(getattr(prompt_details, "cached_tokens", 0) or 0) if prompt_details is not None else 0,
+            reasoning_tokens=(getattr(completion_details, "reasoning_tokens", 0) or 0) if completion_details is not None else 0,
+            cost=float(getattr(usage, "cost", 0.0) or 0.0),
+        )
+        return prompt_tokens
+
+    async def query(self, prompt, model, max_cost, formatter):  # implemented in a later task
+        raise NotImplementedError
+        yield  # pragma: no cover — makes this an async generator per SessionABC
