@@ -44,8 +44,27 @@ class MidStreamError(Exception):
         return f"Provider returned mid-stream error: {self.error}"
 
 
+COMPACTION_PROMPT = (
+    "The conversation is running out of context. Write a dense summary that lets you "
+    "continue the task in a fresh conversation. Include: the original task, overall "
+    "progress so far, key findings and decisions, important file paths and their "
+    "state, and the exact remaining work. Reply with the summary only."
+)
+
+_CONTEXT_LENGTH_RE = re.compile(r"context (length|window)|maximum context", re.IGNORECASE)
+
+
 def _is_context_length_error(e: Exception) -> bool:
-    return False  # implemented in the compaction task
+    if isinstance(e, APIError) and getattr(e, "code", None) == "context_length_exceeded":
+        return True
+    if isinstance(e, MidStreamError):
+        error = e.error
+        if isinstance(error, dict) and _CONTEXT_LENGTH_RE.search(str(error.get("message", ""))):
+            return True
+        return False
+    if isinstance(e, APIError):
+        return _CONTEXT_LENGTH_RE.search(str(e)) is not None
+    return False
 
 
 class OpenRouterResponse(NamedTuple):
@@ -647,4 +666,41 @@ class OpenRouterSession(SessionABC):
             yield OpenRouterResponse(cost=self.total_token_usage.total_cost - initial_cost, status="succeeded", final_message=self._last_message, context_tokens=context_tokens, compaction_count=compaction_count)
 
     async def _compact(self, model: str, resume_hint: bool) -> None:
-        raise RuntimeError("compaction not implemented yet")  # implemented in the compaction task
+        """Client-side compaction: summarize the conversation, rebuild it as one
+        user message. If the summarization request itself overflows, retry with
+        the oldest half of the conversation dropped (up to MAX_COMPACT_TRUNCATIONS)."""
+        conversation = self.conversation
+        for attempt in range(MAX_COMPACT_TRUNCATIONS + 1):
+            messages = []
+            if self.instructions is not None:
+                messages.append({"role": "system", "content": self.instructions})
+            messages.extend(conversation)
+            messages.append({"role": "user", "content": COMPACTION_PROMPT})
+            try:
+                response = await asyncio.wait_for(
+                    self.client.chat.completions.create(
+                        model=model,
+                        messages=messages,
+                        extra_body=self._build_extra_body(),
+                        timeout=self.request_timeout,
+                    ),
+                    timeout=self.request_timeout,
+                )
+                break
+            except (APIError, MidStreamError) as e:
+                if _is_context_length_error(e) and attempt < MAX_COMPACT_TRUNCATIONS:
+                    # drop the oldest half; skip orphaned tool results at the new head
+                    conversation = conversation[len(conversation) // 2:]
+                    while conversation and conversation[0].get("role") == "tool":
+                        conversation = conversation[1:]
+                    continue
+                raise
+
+        if response.usage is not None:
+            self._record_usage(model, response.usage)
+
+        summary = response.choices[0].message.content or ""
+        content = f"Summary of the conversation so far:\n\n{summary}"
+        if resume_hint:
+            content += "\n\ncontinue"
+        self.conversation = [{"role": "user", "content": content}]
