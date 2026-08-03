@@ -9,6 +9,7 @@ from .core import (
     DynamicWorkflowStep,
     ClaudeSession,
     CodexSession,
+    OpenRouterSession,
     StdioMcpServer,
     StreamableHttpMcpServer,
     sandbox_proxy_bypass_hook,

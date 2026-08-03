@@ -39,6 +39,12 @@
   - Fixed audit workflow validator to match prompt requirements
   - Added actionable error messages to help AI fix validation failures
 
+- [x] OpenRouter Session Adapter (2026-08-03)
+  - Added `OpenRouterSession`, a chat-completions-based session backend implementing the session interface
+  - Supports OpenRouter's built-in web search plugin
+  - `add_step` now auto-routes `vendor/model` slugs (containing `/`) to `OpenRouterSession`, GPT model names to `CodexSession`, and everything else to `ClaudeSession` via a shared `_default_session()` helper
+  - Exported as `wake_ai.OpenRouterSession`
+
 - [ ] Implement custom permissions MCP for more granular tool permissions
   - Allow writing/editing only within working_dir by default
   - See https://docs.anthropic.com/en/docs/claude-code/sdk#custom-permission-prompt-tool
