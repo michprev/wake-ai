@@ -15,6 +15,7 @@ def api_keys(monkeypatch):
 def test_slash_slug_selects_openrouter(tmp_path):
     session = _default_session("deepseek/deepseek-chat", tmp_path, tmp_path)
     assert isinstance(session, OpenRouterSession)
+    assert session.writable_roots == [tmp_path]
 
 
 def test_gpt_model_selects_codex(tmp_path):
