@@ -6,7 +6,7 @@ from functools import partial
 from pathlib import Path
 from typing import AsyncIterator, NamedTuple, Literal, Callable, Awaitable, Any
 
-from claude_agent_sdk import AgentDefinition, AssistantMessage, ClaudeAgentOptions, ClaudeSDKClient, HookContext, HookInput, HookJSONOutput, HookMatcher, McpServerConfig, Message, ResultMessage, SandboxIgnoreViolations, SandboxNetworkConfig, SandboxSettings, SystemMessage, TaskNotificationMessage, TaskProgressMessage, TaskStartedMessage, TextBlock, ThinkingBlock, ThinkingConfigAdaptive, ThinkingConfigDisabled, ThinkingConfigEnabled, ToolResultBlock, ToolUseBlock, UserMessage, create_sdk_mcp_server, SdkMcpTool
+from claude_agent_sdk import AgentDefinition, AssistantMessage, ClaudeAgentOptions, ClaudeSDKClient, HookContext, HookInput, HookJSONOutput, HookMatcher, McpServerConfig, Message, PermissionMode, ResultMessage, SandboxIgnoreViolations, SandboxNetworkConfig, SandboxSettings, SystemMessage, TaskNotificationMessage, TaskProgressMessage, TaskStartedMessage, TextBlock, ThinkingBlock, ThinkingConfigAdaptive, ThinkingConfigDisabled, ThinkingConfigEnabled, ToolResultBlock, ToolUseBlock, UserMessage, create_sdk_mcp_server, SdkMcpTool
 from claude_agent_sdk.types import HookEvent, SystemPromptPreset
 
 from .session_abc import SessionABC, FunctionTool
@@ -157,6 +157,7 @@ class ClaudeSession(SessionABC):
     fork_session: str | ClaudeSession | None
     tools: list[FunctionTool]
     env: dict[str, str]
+    permission_mode: PermissionMode
     effort: Literal["low", "medium", "high", "xhigh", "max"] | None
     turn_step: int | None
     sandbox: bool
@@ -180,6 +181,7 @@ class ClaudeSession(SessionABC):
         fork_session: str | ClaudeSession | None = None,
         tools: list[FunctionTool] | None = None,
         env: dict[str, str] | None = None,
+        permission_mode: PermissionMode = "default",
         effort: Literal["low", "medium", "high", "xhigh", "max"] | None = None,
         thinking: ThinkingConfigAdaptive | ThinkingConfigEnabled | ThinkingConfigDisabled | None = None,
         turn_step: int | None = None,
@@ -229,6 +231,7 @@ class ClaudeSession(SessionABC):
 
         self.env["CLAUDECODE"] = ""
 
+        self.permission_mode = permission_mode
         self.effort = effort
         # Native thinking config -> forwarded to the CLI as --thinking / --thinking-display.
         # Prefer this over injecting {"thinking": ...} via CLAUDE_CODE_EXTRA_BODY: the env-body
@@ -419,7 +422,7 @@ class ClaudeSession(SessionABC):
             resume=self._session_id or fork_session_id,
             model=model,
             cwd=str(self.execution_dir),  # Set working directory for command execution
-            permission_mode="default",
+            permission_mode=self.permission_mode,
             max_turns=self.turn_step,
             mcp_servers=mcps,
             agents=self.agents,
