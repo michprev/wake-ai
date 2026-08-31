@@ -88,79 +88,79 @@ class VerboseFormatter:
         with self._file_console() as fc:
             if fc is not None:
                 fc.print(splitter)
-                fc.print("Error: " + message, style=COLORS["error"], markup=False)
+                fc.print("Error: " + message, style=COLORS["error"], markup=False, highlight=False)
 
         self.console.print(splitter)
-        self.console.print("Error: " + message, style=COLORS["error"], markup=False)
+        self.console.print("Error: " + message, style=COLORS["error"], markup=False, highlight=False)
 
     def print_user_message(self, message: str) -> None:
         splitter = self._get_splitter()
         with self._file_console() as fc:
             if fc is not None:
                 fc.print(splitter)
-                fc.print("User: " + message, style=COLORS["user"], markup=False)
+                fc.print("User: " + message, style=COLORS["user"], markup=False, highlight=False)
 
         if self.verbosity == 0 or not should_verbose_log("user"):
             return
 
         self.console.print(splitter)
-        self.console.print("User: " + message, style=COLORS["user"], markup=False)
+        self.console.print("User: " + message, style=COLORS["user"], markup=False, highlight=False)
 
     def print_agent_message(self, message: str) -> None:
         splitter = self._get_splitter()
         with self._file_console() as fc:
             if fc is not None:
                 fc.print(splitter)
-                fc.print("Agent: " + message, style=COLORS["agent"], markup=False)
+                fc.print("Agent: " + message, style=COLORS["agent"], markup=False, highlight=False)
 
         if self.verbosity == 0 or not should_verbose_log("agent"):
             return
 
         self.console.print(splitter)
-        self.console.print("Agent: " + message, style=COLORS["agent"], markup=False)
+        self.console.print("Agent: " + message, style=COLORS["agent"], markup=False, highlight=False)
 
     def print_thinking(self, message: str) -> None:
         splitter = self._get_splitter()
         with self._file_console() as fc:
             if fc is not None:
                 fc.print(splitter)
-                fc.print("Thinking: " + message, style=COLORS["thinking"], markup=False)
+                fc.print("Thinking: " + message, style=COLORS["thinking"], markup=False, highlight=False)
 
         if self.verbosity == 0 or not should_verbose_log("thinking"):
             return
 
         self.console.print(splitter)
-        self.console.print("Thinking: " + message, style=COLORS["thinking"], markup=False)
+        self.console.print("Thinking: " + message, style=COLORS["thinking"], markup=False, highlight=False)
 
     def print_system_message(self, message: str) -> None:
         splitter = self._get_splitter()
         with self._file_console() as fc:
             if fc is not None:
                 fc.print(splitter)
-                fc.print("System: " + message, style=COLORS["system"], markup=False)
+                fc.print("System: " + message, style=COLORS["system"], markup=False, highlight=False)
 
         if self.verbosity == 0 or not should_verbose_log("system"):
             return
 
         self.console.print(splitter)
-        self.console.print("System: " + message, style=COLORS["system"], markup=False)
+        self.console.print("System: " + message, style=COLORS["system"], markup=False, highlight=False)
 
     def print_tool_use(self, name: str, input: dict[str, Any] | str) -> None:
         splitter = self._get_splitter()
         with self._file_console() as fc:
             if fc is not None:
                 fc.print(splitter)
-                fc.print(f"Using tool: {name}", style=COLORS["tool_use"], markup=False)
+                fc.print(f"Using tool: {name}", style=COLORS["tool_use"], markup=False, highlight=False)
                 if input:
-                    fc.print(input, style=COLORS["tool_input"], markup=False)
+                    fc.print(input, style=COLORS["tool_input"], markup=False, highlight=False)
 
         if self.verbosity == 0 or not should_verbose_log("tool"):
             return
 
         self.console.print(splitter)
-        self.console.print(f"Using tool: {name}", style=COLORS["tool_use"], markup=False)
+        self.console.print(f"Using tool: {name}", style=COLORS["tool_use"], markup=False, highlight=False)
         if input:
-            self.console.print(input, style=COLORS["tool_input"], markup=False)
+            self.console.print(input, style=COLORS["tool_input"], markup=False, highlight=False)
 
     def print_tool_result(self, result: str | dict[str, Any] | list[dict[str, Any]], is_error: bool) -> None:
         def print_single(console: Console, result: str | dict[str, Any]) -> None:
@@ -169,11 +169,11 @@ class VerboseFormatter:
                     try:
                         console.print_json(result["text"])
                     except json.JSONDecodeError:
-                        console.print(result["text"], style=style, markup=False)
+                        console.print(result["text"], style=style, markup=False, highlight=False)
                 else:
-                    console.print(result, style=style, markup=False)
+                    console.print(result, style=style, markup=False, highlight=False)
             else:
-                console.print(result, style=style, markup=False)
+                console.print(result, style=style, markup=False, highlight=False)
 
         style = COLORS["tool_result"] if not is_error else COLORS["tool_error"]
         splitter = self._get_splitter()
